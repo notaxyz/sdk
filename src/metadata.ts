@@ -1,4 +1,4 @@
-import { getAddress, keccak256, stringToBytes, zeroAddress, zeroHash, type Address, type Hex } from "viem";
+import { getAddress, isAddress, keccak256, stringToBytes, zeroAddress, zeroHash, type Address, type Hex } from "viem";
 
 import type { NotaDeployment } from "./addresses.js";
 import { canonicalize } from "./jcs.js";
@@ -120,7 +120,9 @@ export function findMetadataProblems(
   if (!sameAddress(protocol.receiptStore, deployment.store)) problems.push("metadata protocol.receiptStore is not the known store");
   if (!sameAddress(protocol.settlementToken, deployment.usdc)) problems.push("metadata protocol.settlementToken is not USDC");
 
-  if (typeof metadata.seller !== "string") problems.push("metadata seller is missing");
+  if (typeof metadata.seller !== "string" || !isAddress(metadata.seller, { strict: false }) || metadata.seller.toLowerCase() === zeroAddress) {
+    problems.push("metadata seller is missing or not a valid address");
+  }
 
   const listing = isObject(metadata.listing) ? metadata.listing : {};
   if (listing.listingId !== quote.listingId.toString()) problems.push("metadata listingId does not match the quote");

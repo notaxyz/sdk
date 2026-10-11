@@ -220,7 +220,10 @@ export interface ReadRequestOptions {
   payer?: Address;
   /** Overrides the link's unsigned `fromBlock` hint for the receipt search. */
   fromBlock?: bigint;
+  /** See `ReceiptSearchOptions`. */
   maxBlockRange?: bigint;
+  /** See `ReceiptSearchOptions`. */
+  maxRanges?: number;
 }
 
 const VALIDATION_ERROR_STATUS: Record<string, ReadRequestResult["status"]> = {
@@ -272,8 +275,8 @@ export async function readRequest(input: RequestInput, options: ReadRequestOptio
   // 3. Listing ownership: the seller named in the signed metadata must own the listing.
   const listing = await readListing(publicClient, deployment, request.quote.listingId);
   if (!listing) return result("listing_inactive", `listing ${request.quote.listingId} does not exist`);
-  if (!sameAddress(listing.seller, request.metadata.seller)) {
-    return result("invalid_signature", `listing ${request.quote.listingId} belongs to ${listing.seller}, not ${request.metadata.seller}`);
+  if (!sameAddress(listing.seller, request.seller)) {
+    return result("invalid_signature", `listing ${request.quote.listingId} belongs to ${listing.seller}, not ${request.seller}`);
   }
   if (listing.listingHash.toLowerCase() !== request.metadata.listing.listingHash.toLowerCase()) {
     return result("tampered", "metadata listingHash does not match the on-chain listing");
@@ -288,6 +291,7 @@ export async function readRequest(input: RequestInput, options: ReadRequestOptio
       seller: listing.seller,
       fromBlock: options.fromBlock ?? request.fromBlock,
       ...(options.maxBlockRange !== undefined ? { maxBlockRange: options.maxBlockRange } : {}),
+      ...(options.maxRanges !== undefined ? { maxRanges: options.maxRanges } : {}),
     });
     if (receipt) return result("paid", undefined, { receipt });
     return result(

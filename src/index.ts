@@ -26,6 +26,7 @@ export {
   waitForReceipt,
   findMatchingReceipt,
   DEFAULT_MAX_BLOCK_RANGE,
+  DEFAULT_MAX_RANGES,
   type GetReceiptParams,
   type WaitForReceiptParams,
   type ReceiptSearchOptions,

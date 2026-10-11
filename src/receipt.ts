@@ -1,4 +1,4 @@
-import { decodeEventLog, type Log, type PublicClient } from "viem";
+import { BlockNotFoundError, decodeEventLog, zeroAddress, type Log, type PublicClient } from "viem";
 
 import { purchaseRefRegistryAbi, receiptPurchasedV2Event } from "./abi.js";
 import type { NotaDeployment } from "./addresses.js";
@@ -10,6 +10,10 @@ import { readListing, sameAddress } from "./chain.js";
 import type { NotaReceipt, PaymentRequest } from "./types.js";
 
 export const DEFAULT_MAX_BLOCK_RANGE = 5_000n;
+/** Most `eth_getLogs` ranges one receipt search may scan before giving up. */
+export const DEFAULT_MAX_RANGES = 500;
+/** How far before `issuedAt` the `fromBlock` hint's block may be. */
+export const MAX_HINT_LEAD_SECONDS = 3600n;
 export const DEFAULT_POLL_INTERVAL_MS = 4_000;
 
 export type RequestInput = PaymentRequest | LinkPayload | string;
@@ -19,6 +23,8 @@ export interface ReceiptSearchOptions {
   fromBlock?: bigint;
   /** Largest block span per `eth_getLogs` call. Public RPCs often cap this. Default 5000. */
   maxBlockRange?: bigint;
+  /** Most `eth_getLogs` calls one search may make; the search reports no receipt when exhausted. Default 500. */
+  maxRanges?: number;
 }
 
 /**
@@ -70,26 +76,45 @@ export function receiptFromLog(log: Log, chainId: number): NotaReceipt | undefin
 
 /**
  * Scan for the request's matching receipt from `fromBlock`, in bounded ranges, filtered on the
- * indexed purchaseRef and seller topics. Stops at the latest block, or once a range ends after
- * the quote's expiry (a valid purchase cannot land later). Returns null when nothing matches.
+ * indexed purchaseRef and seller topics. Returns null when nothing matches.
+ *
+ * The search is bounded so an untrusted hint cannot cause a long scan:
+ *   - The block at `fromBlock` must exist and its timestamp must lie between
+ *     `issuedAt - 3600` and `expiresAt`; otherwise the hint is invalid and the result is null
+ *     (which callers report as "blocked", never "paid").
+ *   - It stops at the latest block, once a range ends after the quote's expiry (a valid purchase
+ *     cannot land later), or after `maxRanges` ranges.
  */
-export async function findMatchingReceipt(params: {
-  publicClient: PublicClient;
-  deployment: NotaDeployment;
-  request: PaymentRequest;
-  seller: `0x${string}`;
-  fromBlock: bigint | undefined;
-  maxBlockRange?: bigint;
-}): Promise<NotaReceipt | null> {
+export async function findMatchingReceipt(
+  params: {
+    publicClient: PublicClient;
+    deployment: NotaDeployment;
+    request: PaymentRequest;
+    seller: `0x${string}`;
+    fromBlock: bigint | undefined;
+  } & Omit<ReceiptSearchOptions, "fromBlock">,
+): Promise<NotaReceipt | null> {
   const { publicClient, deployment, request, seller } = params;
-  if (params.fromBlock === undefined) return null;
+  if (params.fromBlock === undefined || params.fromBlock < 0n) return null;
   const maxRange = params.maxBlockRange ?? DEFAULT_MAX_BLOCK_RANGE;
   if (maxRange < 1n) throw new NotaError("invalid_argument", "maxBlockRange must be at least 1");
+  const maxRanges = params.maxRanges ?? DEFAULT_MAX_RANGES;
+  if (!Number.isInteger(maxRanges) || maxRanges < 1) throw new NotaError("invalid_argument", "maxRanges must be a positive integer");
+
+  // Validate the hint before scanning anything.
+  let start;
+  try {
+    start = await publicClient.getBlock({ blockNumber: params.fromBlock });
+  } catch (error) {
+    if (error instanceof BlockNotFoundError) return null;
+    throw error;
+  }
+  if (!start || start.timestamp + MAX_HINT_LEAD_SECONDS < request.quote.issuedAt || start.timestamp > request.quote.expiresAt) return null;
 
   // cacheTime 0: a cached (stale) head would end the search before a just-mined receipt.
   const latest = await publicClient.getBlockNumber({ cacheTime: 0 });
   let from = params.fromBlock;
-  while (from <= latest) {
+  for (let ranges = 0; from <= latest && ranges < maxRanges; ranges++) {
     const to = from + maxRange - 1n < latest ? from + maxRange - 1n : latest;
     const logs = await publicClient.getLogs({
       address: deployment.store,
@@ -128,6 +153,9 @@ async function resolveRequest(publicClient: PublicClient, input: RequestInput): 
   if (hashCheckoutMetadata(request.metadata).toLowerCase() !== request.quote.metadataHash.toLowerCase()) {
     throw new NotaError("invalid_argument", "request metadata does not match quote.metadataHash");
   }
+  if (request.seller === zeroAddress) {
+    throw new NotaError("invalid_argument", "request metadata names no valid seller, so no receipt can match it");
+  }
   return { deployment, request };
 }
 
@@ -144,7 +172,7 @@ export async function isPurchaseRefConsumed(publicClient: PublicClient, deployme
 /** The listing's on-chain seller, which must be the seller the request names. */
 async function onChainSeller(publicClient: PublicClient, deployment: NotaDeployment, request: PaymentRequest): Promise<`0x${string}` | undefined> {
   const listing = await readListing(publicClient, deployment, request.quote.listingId);
-  if (!listing || !sameAddress(listing.seller, request.metadata.seller)) return undefined;
+  if (!listing || !sameAddress(listing.seller, request.seller)) return undefined;
   return listing.seller;
 }
 
@@ -193,8 +221,9 @@ async function requireMatchingReceipt(
     seller,
     fromBlock,
     ...(options.maxBlockRange !== undefined ? { maxBlockRange: options.maxBlockRange } : {}),
+    ...(options.maxRanges !== undefined ? { maxRanges: options.maxRanges } : {}),
   });
-  if (!receipt) throw blocked(request, `no matching ReceiptPurchasedV2 log from block ${fromBlock}`);
+  if (!receipt) throw blocked(request, `no matching ReceiptPurchasedV2 log found from block ${fromBlock} (or that block is not a valid starting point)`);
   return receipt;
 }
 
