@@ -37,7 +37,8 @@ const suites: { name: string; chain: Chain; rpcEnv: string; hasAttestReceipt: bo
 for (const suite of suites) {
   const forkUrl = process.env[suite.rpcEnv];
 
-  describe.skipIf(!forkUrl)(`fork: ${suite.name}`, () => {
+  // Public RPCs can be slow to serve fork state on first touch.
+  describe.skipIf(!forkUrl)(`fork: ${suite.name}`, { timeout: 120_000 }, () => {
     const deployment: NotaDeployment = NOTA_DEPLOYMENTS[suite.chain.id as 42161 | 8453];
     const sellerAccount = privateKeyToAccount(generatePrivateKey());
     const strangerAccount = privateKeyToAccount(generatePrivateKey());
