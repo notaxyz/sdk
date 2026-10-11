@@ -14,6 +14,7 @@ export type NotaErrorCode =
   | "receipt_mismatch"
   | "timeout"
   | "transaction_failed"
+  | "purchase_simulation_failed"
   | "unexpected_revert";
 
 export class NotaError extends Error {

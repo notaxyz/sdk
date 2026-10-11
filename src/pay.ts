@@ -1,4 +1,4 @@
-import { encodeFunctionData, parseEventLogs, type Address, type Hex, type PublicClient, type WalletClient } from "viem";
+import { BaseError, ExecutionRevertedError, encodeFunctionData, parseEventLogs, type Address, type Hex, type PublicClient, type WalletClient } from "viem";
 
 import { erc20Abi, notaReceiptStoreAbi } from "./abi.js";
 import { assertDeployment } from "./deployment.js";
@@ -91,6 +91,15 @@ export async function preparePayCalls(params: PreparePayCallsParams): Promise<Pr
   return { calls, needsApproval };
 }
 
+/** Retries of the purchase simulation right after a fresh approval, 1 second apart. */
+export const PURCHASE_SIMULATION_RETRIES = 5;
+const PURCHASE_SIMULATION_RETRY_DELAY_MS = 1_000;
+
+function isRevert(error: unknown): boolean {
+  if (!(error instanceof BaseError)) return false;
+  return error.walk((cause) => cause instanceof ExecutionRevertedError || (cause as { code?: unknown }).code === 3) !== null;
+}
+
 export type PayStepName = "approve" | "pay";
 export type PayStepState = "skipped" | "awaiting_signature" | "submitted" | "confirmed";
 
@@ -147,9 +156,11 @@ export async function payRequest(params: PayRequestParams): Promise<PayRequestRe
   await assertWalletChain(walletClient, deployment.chainId);
   const chain = walletClient.chain ?? null;
 
-  const send = async (step: PayStepName, call: PayCall) => {
+  const simulate = (call: PayCall) => publicClient.call({ account, to: call.to, data: call.data });
+
+  const send = async (step: PayStepName, call: PayCall, simulateFirst: (call: PayCall) => Promise<unknown> = simulate) => {
     // Simulate right before sending, so a revert surfaces before it costs gas.
-    await publicClient.call({ account, to: call.to, data: call.data });
+    await simulateFirst(call);
     report({ step, state: "awaiting_signature" });
     const txHash = await walletClient.sendTransaction({ account, chain, to: call.to, data: call.data });
     report({ step, state: "submitted", txHash });
@@ -171,12 +182,37 @@ export async function payRequest(params: PayRequestParams): Promise<PayRequestRe
     report({ step: "approve", state: "skipped" });
   }
 
-  const { txHash: payTxHash, txReceipt } = await send("pay", purchaseCall);
+  // Right after an approval, the RPC node answering the simulation may not see the new allowance
+  // yet (load-balanced or lagging nodes), so a revert there is retried before giving up.
+  const simulateAfterApproval = async (call: PayCall, approvedIn: Hex) => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await simulate(call);
+      } catch (error) {
+        if (!isRevert(error)) throw error;
+        if (attempt >= PURCHASE_SIMULATION_RETRIES) {
+          throw new NotaError(
+            "purchase_simulation_failed",
+            `The USDC approval succeeded (${approvedIn}), but the purchase still fails to simulate after ` +
+              `${PURCHASE_SIMULATION_RETRIES} retries: ${(error as Error).message.split("\n")[0]}. ` +
+              "Nothing was charged. Paying again will skip the approval.",
+            { approveTxHash: approvedIn },
+            { cause: error },
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, PURCHASE_SIMULATION_RETRY_DELAY_MS));
+      }
+    }
+  };
+
+  const approvedIn = approveTxHash;
+  const simulatePurchase = approvedIn === undefined ? simulate : (call: PayCall) => simulateAfterApproval(call, approvedIn);
+  const { txHash: payTxHash, txReceipt } = await send("pay", purchaseCall, simulatePurchase);
   const logs = parseEventLogs({ abi: notaReceiptStoreAbi, eventName: "ReceiptPurchasedV2", logs: txReceipt.logs });
   for (const log of logs) {
     if (!sameAddress(log.address, deployment.store)) continue;
     const receipt = receiptFromLog(log, deployment.chainId);
-    if (receipt && matchesRequest(receipt, request, request.metadata.seller) && sameAddress(receipt.payer, payer)) {
+    if (receipt && matchesRequest(receipt, request, request.seller) && sameAddress(receipt.payer, payer)) {
       return { ...(approveTxHash ? { approveTxHash } : {}), payTxHash, receipt };
     }
   }
