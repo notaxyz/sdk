@@ -3,25 +3,27 @@
  * a verified on-chain receipt arrives.
  *
  *   export AGENT_PRIVATE_KEY=0x...   # issuing hot wallet: needs a little ETH for the one-time setup
- *   export ARBITRUM_RPC_URL=https://...
+ *   export RPC_URL=https://...       # or ARBITRUM_RPC_URL; the chain is taken from the RPC's chain id
  *   npx tsx examples/agent.ts                      # first run: prints the setup transaction, exits
  *   npx tsx examples/agent.ts --setup              # sends the one-time createListing transaction
  *   npx tsx examples/agent.ts --amount 0.10 --purpose "run 100 more searches"
+ *   npx tsx examples/agent.ts --base-url http://localhost:3000/pay   # links for a local payment page
  *
+ * Supported chains: Arbitrum One, Base, and the Arbitrum Sepolia testnet.
  * The private key is read from the environment and never printed or logged.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 
-import { createPublicClient, createWalletClient, http, type Hex, type PublicClient } from "viem";
+import { createPublicClient, createWalletClient, http, type Chain, type Hex, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { arbitrum } from "viem/chains";
+import { arbitrum, arbitrumSepolia, base } from "viem/chains";
 
 import {
   createRequest,
   formatUsdc,
   isNotaError,
-  NOTA_DEPLOYMENTS,
+  getDeployment,
   parseUsdc,
   prepareSetup,
   setup,
@@ -54,18 +56,29 @@ const { values: flags } = parseArgs({
     purpose: { type: "string", default: "continue the current task" },
     expires: { type: "string", default: "3600" },
     setup: { type: "boolean", default: false },
+    "base-url": { type: "string" },
   },
 });
 
+const CHAINS: Record<number, Chain> = { [arbitrum.id]: arbitrum, [base.id]: base, [arbitrumSepolia.id]: arbitrumSepolia };
+
 const privateKey = process.env.AGENT_PRIVATE_KEY;
-const rpcUrl = process.env.ARBITRUM_RPC_URL;
+const rpcUrl = process.env.RPC_URL || process.env.ARBITRUM_RPC_URL;
 if (!privateKey || !/^0x[0-9a-fA-F]{64}$/.test(privateKey)) fail("AGENT_PRIVATE_KEY must be set to a 0x-prefixed 32-byte hex key.");
-if (!rpcUrl) fail("ARBITRUM_RPC_URL must be set.");
+if (!rpcUrl) fail("RPC_URL (or ARBITRUM_RPC_URL) must be set.");
+const baseUrl = flags["base-url"];
+if (baseUrl !== undefined && !/^https?:\/\/[^#]+$/.test(baseUrl)) fail("--base-url must be an http(s) URL without a fragment.");
+
+// The chain comes from the RPC endpoint itself, not from an assumption.
+const chainId = await createPublicClient({ transport: http(rpcUrl) }).getChainId();
+const chain = CHAINS[chainId];
+const deployment = getDeployment(chainId);
+if (!chain || !deployment) fail(`The RPC is on chain ${chainId}, which Nota does not support (Arbitrum One, Base, Arbitrum Sepolia).`);
 
 const account = privateKeyToAccount(privateKey as Hex);
-const publicClient = createPublicClient({ chain: arbitrum, transport: http(rpcUrl) }) as PublicClient;
-const walletClient = createWalletClient({ chain: arbitrum, account, transport: http(rpcUrl) });
-const deployment = NOTA_DEPLOYMENTS[42161];
+const publicClient = createPublicClient({ chain, transport: http(rpcUrl) }) as PublicClient;
+const walletClient = createWalletClient({ chain, account, transport: http(rpcUrl) });
+console.log(`Chain: ${deployment.name} (${chainId})${deployment.testnet ? " [testnet]" : ""}`);
 const stateKey = `${deployment.chainId}:${account.address.toLowerCase()}`;
 
 function loadListingId(): bigint | undefined {
@@ -93,7 +106,7 @@ if (listingId === undefined) {
   const prepared = await prepareSetup({ publicClient, listing: LISTING });
   if (!flags.setup) {
     console.log("No listing saved for this wallet yet. One-time setup transaction (NOT sent):");
-    console.log(`  chain:       Arbitrum One (${prepared.chainId})`);
+    console.log(`  chain:       ${deployment.name} (${prepared.chainId})`);
     console.log(`  from:        ${account.address}`);
     console.log(`  to:          ${prepared.to}  (NotaReceiptStore)`);
     console.log(`  value:       0`);
@@ -119,6 +132,7 @@ const request = await createRequest({
   amount,
   purpose: flags.purpose,
   expiresInSeconds,
+  ...(baseUrl !== undefined ? { baseUrl } : {}),
 });
 console.log(`Pay here: ${request.url}`);
 console.log(`Waiting for payment (expires ${new Date(Number(request.quote.expiresAt) * 1000).toISOString()}) ...`);
@@ -128,7 +142,7 @@ try {
   console.log(`Payer:      ${receipt.payer}`);
   console.log(`Amount:     ${usdc(receipt.amount)} USDC`);
   console.log(`Receipt id: ${receipt.receiptId}`);
-  console.log(`Arbiscan:   ${deployment.explorer}/tx/${receipt.txHash}`);
+  console.log(`Explorer:   ${deployment.explorer}/tx/${receipt.txHash}`);
   console.log("Funded. Continuing.");
 } catch (error) {
   if (isNotaError(error, "purchase_ref_blocked")) {

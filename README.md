@@ -1,6 +1,6 @@
 # @notaxyz/sdk
 
-`@notaxyz/sdk` lets an agent, or any seller, turn a USDC amount and a purpose into a signed payment link. Anyone with the link can pay it in USDC on Arbitrum One or Base. Payment goes through the deployed Nota receipt contract, which sends the funds straight to the issuer and emits an on-chain receipt that the issuer can wait for and verify. There is no backend, database or hosted service: everything happens client-side, plus reads and writes against the chain.
+`@notaxyz/sdk` lets an agent, or any seller, turn a USDC amount and a purpose into a signed payment link. Anyone with the link can pay it in USDC on Arbitrum One or Base, or with test USDC on the Arbitrum Sepolia testnet. Payment goes through the deployed Nota receipt contract, which sends the funds straight to the issuer and emits an on-chain receipt that the issuer can wait for and verify. There is no backend, database or hosted service: everything happens client-side, plus reads and writes against the chain.
 
 ## Install
 
@@ -48,10 +48,14 @@ console.log(`Funded by ${receipt.payer}, receipt #${receipt.receiptId}, tx ${rec
 [`examples/agent.ts`](examples/agent.ts) is a complete runnable agent:
 
 ```bash
-AGENT_PRIVATE_KEY=0x... ARBITRUM_RPC_URL=https://... npx tsx examples/agent.ts --amount 0.10 --purpose "run 100 more searches"
+AGENT_PRIVATE_KEY=0x... RPC_URL=https://... npx tsx examples/agent.ts --amount 0.10 --purpose "run 100 more searches"
 ```
 
-On the first run it prints the setup transaction it would send and exits. Run it with `--setup` to send that transaction.
+The example works like this:
+- **Chain:** it takes the chain from the RPC's chain id (Arbitrum One, Base or the Arbitrum Sepolia testnet).
+- **RPC variable:** it reads `RPC_URL`, or `ARBITRUM_RPC_URL` if `RPC_URL` isn't set.
+- **Setup:** on the first run it prints the setup transaction it would send and exits. Run it with `--setup` to send that transaction.
+- **Local testing:** `--base-url http://localhost:3000/pay` makes the links point at a local payment page.
 
 ## For a payer
 
@@ -65,7 +69,26 @@ if (status === "payable") {
 }
 ```
 
-`payRequest` runs `readRequest` first and refuses anything that isn't `"payable"`. When the payer's existing allowance is too low, it approves the store for **exactly** the quoted amount, never an unlimited amount. It then calls `purchaseSignedReceipt`, which moves the USDC from the payer through the store to the seller in the same transaction. It returns the verified receipt from that transaction's `ReceiptPurchasedV2` log.
+`payRequest` runs `readRequest` first and refuses anything that isn't `"payable"`. It also checks the payer's USDC balance. When the payer's existing allowance is too low, it approves the store for **exactly** the quoted amount, never an unlimited amount. It then calls `purchaseSignedReceipt`, which moves the USDC from the payer through the store to the seller in the same transaction. It returns the verified receipt from that transaction's `ReceiptPurchasedV2` log.
+
+### Smart accounts: one batched operation
+
+`preparePayCalls` performs the same checks as `payRequest` and returns the calls without sending anything:
+- it refuses anything that isn't `"payable"`
+- it checks the payer's balance
+- it adds an exact-amount approval only when the allowance is short
+
+A smart account can batch the returned calls into one operation:
+
+```ts
+import { preparePayCalls } from "@notaxyz/sdk";
+
+const { calls, needsApproval } = await preparePayCalls({ publicClient, request: url, payer: smartAccount.address });
+// calls: [{ to: USDC, data: approve(store, amount) }?, { to: store, data: purchaseSignedReceipt(...) }], all with value 0
+await walletClient.sendCalls({ account: smartAccount, calls }); // EIP-5792, e.g. viem
+```
+
+`payRequest` uses `preparePayCalls` internally and sends the calls one at a time.
 
 ## Link format
 
@@ -122,15 +145,19 @@ Malformed input and unknown link versions throw `NotaError` with code `"invalid_
 
 ## Supported chains and addresses
 
-The addresses are identical on both chains:
+| | Arbitrum One (42161) | Base (8453) | Arbitrum Sepolia (421614), **testnet** |
+| --- | --- | --- | --- |
+| NotaReceiptStore | `0xf6062F3F52D3E19cb9cc3e027491a5c11D101F88` | `0xf6062F3F52D3E19cb9cc3e027491a5c11D101F88` | `0x6b13e2077c84e1326111acBbb618E028723e2EA2` |
+| PurchaseRefRegistry | `0x9AaFfA5787ca332a40B9C98E3e5323A97F96D991` | `0x9AaFfA5787ca332a40B9C98E3e5323A97F96D991` | `0x32aAeC7768adBBFD65C776b129616b8727d0c8bd` |
+| USDC | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d` (test USDC, no value) |
+| Explorer | arbiscan.io | basescan.org | sepolia.arbiscan.io |
 
-| | Arbitrum One (42161) | Base (8453) |
-| --- | --- | --- |
-| NotaReceiptStore | `0xf6062F3F52D3E19cb9cc3e027491a5c11D101F88` | `0xf6062F3F52D3E19cb9cc3e027491a5c11D101F88` |
-| PurchaseRefRegistry | `0x9AaFfA5787ca332a40B9C98E3e5323A97F96D991` | `0x9AaFfA5787ca332a40B9C98E3e5323A97F96D991` |
-| USDC | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
+Arbitrum Sepolia is a testnet for trying the flow end to end with test USDC. Its deployment entry is marked `testnet: true`.
 
-Before first use with a client, the SDK reads the store's `SETTLEMENT_TOKEN`, `PURCHASE_REF_REGISTRY` and EIP-712 name and version, and refuses to proceed if any of them differs from this table. The table is exported as `NOTA_DEPLOYMENTS`, and the ABIs are exported too.
+Before first use with a client, the SDK checks the store against this table and refuses to proceed if anything differs. It reads:
+- `SETTLEMENT_TOKEN` and `PURCHASE_REF_REGISTRY`
+- the EIP-712 name and version
+- `SIGNED_RECEIPT_QUOTE_TYPEHASH` The table is exported as `NOTA_DEPLOYMENTS`, and the ABIs are exported too.
 
 ## Warning: the issuing wallet is a hot wallet
 
@@ -166,6 +193,7 @@ The `fromBlock` hint in the link isn't signed. If the hint is missing or wrong, 
 | `createRequest({ walletClient \| account, publicClient, listingId, amount, purpose, expiresInSeconds?, agentId?, baseUrl? })` | `{ url, purchaseRef, quote, signature, metadata, fromBlock, chainId, store }` |
 | `readRequest(urlOrPayload, { publicClient, payer?, fromBlock? })` | `{ status, request, receipt?, reason? }` |
 | `payRequest({ walletClient, publicClient, request })` | `{ approveTxHash?, payTxHash, receipt }` |
+| `preparePayCalls({ publicClient, request, payer })` | `{ calls: [{ to, data }], needsApproval }` |
 | `waitForReceipt({ publicClient, request, fromBlock?, timeoutMs?, maxBlockRange? })` | `receipt` |
 | `getReceipt({ publicClient, request, fromBlock?, maxBlockRange? })` | `receipt \| null` |
 
@@ -176,7 +204,7 @@ Log searches run in bounded block ranges (`maxBlockRange`, default 5000), so pub
 ```bash
 npm ci
 npm run lint && npm run typecheck && npm test
-ARBITRUM_RPC_URL=https://... BASE_RPC_URL=https://... npm test   # adds the anvil fork tests (needs Foundry)
+ARBITRUM_RPC_URL=https://... BASE_RPC_URL=https://... ARBITRUM_SEPOLIA_RPC_URL=https://... npm test   # adds the anvil fork tests (needs Foundry)
 ```
 
 Without the RPC URLs, the fork tests are reported as skipped. They never broadcast anything: they run against a local `anvil --fork-url`.
