@@ -86,7 +86,8 @@ export async function findMatchingReceipt(params: {
   const maxRange = params.maxBlockRange ?? DEFAULT_MAX_BLOCK_RANGE;
   if (maxRange < 1n) throw new NotaError("invalid_argument", "maxBlockRange must be at least 1");
 
-  const latest = await publicClient.getBlockNumber();
+  // cacheTime 0: a cached (stale) head would end the search before a just-mined receipt.
+  const latest = await publicClient.getBlockNumber({ cacheTime: 0 });
   let from = params.fromBlock;
   while (from <= latest) {
     const to = from + maxRange - 1n < latest ? from + maxRange - 1n : latest;

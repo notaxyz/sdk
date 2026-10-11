@@ -1,4 +1,4 @@
-import { createWalletClient, custom, decodeFunctionData, getAddress, zeroAddress, type Hex } from "viem";
+import { createPublicClient, createWalletClient, custom, decodeFunctionData, getAddress, zeroAddress, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -386,6 +386,15 @@ describe("consumed is never paid", () => {
     expect((await readRequest(lateHint, { publicClient: chain.client })).status).toBe("blocked");
     expect((await readRequest(noHint, { publicClient: chain.client, fromBlock: created.fromBlock })).status).toBe("paid");
     await expect(getReceipt({ publicClient: chain.client, request: noHint })).rejects.toMatchObject({ code: "purchase_ref_blocked" });
+  });
+
+  it("a receipt mined just after a previous read is found (no stale cached head)", async () => {
+    // viem caches eth_blockNumber for the client's pollingInterval; the search must not use it.
+    const slowCacheClient = createPublicClient({ transport: custom({ request: (a) => chain.request(a) }, { retryCount: 0 }), pollingInterval: 60_000 });
+    expect((await readRequest(created, { publicClient: slowCacheClient as never })).status).toBe("payable");
+    await slowCacheClient.getBlockNumber(); // warm the cache at the pre-payment head
+    chain.emitReceipt(receiptFieldsFor(created));
+    expect((await readRequest(created, { publicClient: slowCacheClient as never })).status).toBe("paid");
   });
 
   it("searches in bounded block ranges", async () => {
