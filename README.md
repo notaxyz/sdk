@@ -101,7 +101,7 @@ const { calls, needsApproval } = await preparePayCalls({ publicClient, request: 
 await walletClient.sendCalls({ account: smartAccount, calls }); // EIP-5792, e.g. viem
 ```
 
-`payRequest` uses `preparePayCalls` internally and sends the calls one at a time.
+`payRequest` uses `preparePayCalls` internally and sends the calls one at a time. Right after a fresh approval, an RPC node may not yet see the new allowance. In that case `payRequest` retries the purchase simulation up to 5 times, 1 second apart. If it still fails, it throws `NotaError` with code `"purchase_simulation_failed"`. Nothing was charged at that point, and paying again skips the approval.
 
 ## MCP server for AI clients
 
@@ -231,8 +231,10 @@ const request = await createRequest({ account: serverSigner, publicClient, listi
 ```
 
 The roles split like this:
-- **Seller:** keep it cold. It's needed only for `setup`, `authorizeSigner` and `revokeSigner`, and it receives every payment.
-- **Signer:** a hot key that holds no funds and needs no gas. If it leaks, an attacker can issue requests in your name, but every payment still lands with the seller.
+- **Seller:** keep it cold. It's needed only for `setup`, `authorizeSigner` and `revokeSigner`, and it receives the payments.
+- **Signer:** a hot key that holds no funds and needs no gas. If it leaks, an attacker can issue requests in your name until you revoke it. What they can do with those requests depends on the payment path:
+  - **Through this SDK,** the whole payment reaches the seller. `readRequest` reports any quote with an integrator fee as `tampered`, and `payRequest` and `preparePayCalls` refuse it.
+  - **Through the contract directly,** an authorized signer's quote may include an integrator fee of up to 4.5% of the payment, paid to any address the signer chooses. A leaked signer used with a payer who skips these checks could therefore divert up to 4.5% of each such payment until it's revoked. The seller still receives the rest.
 - **Revoking:** `revokeSigner` cuts a leaked signer off. Its unpaid requests immediately read `invalid_signature`, while requests already paid stay `paid`.
 - **Limit:** the contract allows up to 3 authorized signers per listing.
 
@@ -271,7 +273,12 @@ The `fromBlock` hint in the link isn't signed. If the hint is missing or wrong, 
 | `waitForReceipt({ publicClient, request, fromBlock?, timeoutMs?, maxBlockRange? })` | `receipt` |
 | `getReceipt({ publicClient, request, fromBlock?, maxBlockRange? })` | `receipt \| null` |
 
-Log searches run in bounded block ranges (`maxBlockRange`, default 5000), so public RPCs with log-range caps work.
+Log searches are bounded, so neither a public RPC's log-range cap nor a bad link can cause a runaway scan:
+- **Range size:** each `eth_getLogs` call covers at most `maxBlockRange` blocks (default 5000).
+- **Range count:** a search makes at most `maxRanges` calls (default 500).
+- **Hint check:** before scanning anything, the block at the `fromBlock` hint is checked. It must exist, and its timestamp must fall no more than 3600 seconds before the quote's `issuedAt` and no later than `expiresAt`.
+
+A hint that fails this check, or a search that runs out of ranges, gives `blocked`, never `paid`.
 
 ## Development
 

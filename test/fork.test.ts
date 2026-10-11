@@ -166,6 +166,12 @@ for (const suite of suites) {
       const { fromBlock: _drop, ...noHint } = paid;
       expect((await readRequest(noHint, { publicClient: fork.publicClient })).status).toBe("blocked");
       expect((await readRequest({ ...paid, fromBlock: paidBlock + 1n }, { publicClient: fork.publicClient })).status).toBe("blocked");
+      // Genesis-era hints are rejected up front instead of scanning hundreds of millions of blocks.
+      for (const fromBlock of [0n, 1n]) {
+        expect((await readRequest({ ...paid, fromBlock }, { publicClient: fork.publicClient })).status).toBe("blocked");
+        await expect(getReceipt({ publicClient: fork.publicClient, request: paid, fromBlock })).rejects.toMatchObject({ code: "purchase_ref_blocked" });
+      }
+      expect((await readRequest(paid, { publicClient: fork.publicClient })).status).toBe("paid");
     });
 
     it("skips the approval when the allowance already covers the amount", async () => {

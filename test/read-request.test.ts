@@ -10,6 +10,7 @@ import {
   erc20Abi,
   getReceipt,
   isNotaError,
+  NotaError,
   notaReceiptStoreAbi,
   payRequest,
   preparePayCalls,
@@ -64,7 +65,8 @@ async function resign(request: PaymentRequest, signer = seller): Promise<Payment
       store: chain.deployment.store,
       settlementToken: chain.deployment.usdc,
       purchaseRefRegistry: chain.deployment.registry,
-      seller: request.metadata.seller,
+      // The listing's seller, as the contract does; works even when the metadata names none.
+      seller: chain.listings.get(request.quote.listingId)?.seller ?? request.seller,
     }),
   );
   return { ...request, signature };
@@ -423,6 +425,109 @@ describe("consumed is never paid", () => {
   });
 });
 
+describe("bounded receipt search", () => {
+  const methodCount = (since: number, method: string) => chain.rpcCalls.slice(since).filter((m) => m === method).length;
+
+  it("a paid link with fromBlock 0 or 1 reads blocked without scanning", async () => {
+    chain.mine(50_000n, 100_000n); // a long chain between genesis and now
+    const r = await newRequest();
+    chain.emitReceipt(receiptFieldsFor(r));
+    for (const fromBlock of [0n, 1n]) {
+      const before = chain.rpcCalls.length;
+      const read = await readRequest({ ...r, fromBlock }, { publicClient: chain.client });
+      expect(read.status).toBe("blocked");
+      expect(methodCount(before, "eth_getLogs")).toBe(0);
+      expect(chain.rpcCalls.length - before).toBeLessThanOrEqual(10);
+
+      const beforeGet = chain.rpcCalls.length;
+      await expect(getReceipt({ publicClient: chain.client, request: r, fromBlock })).rejects.toMatchObject({ code: "purchase_ref_blocked" });
+      await expect(
+        waitForReceipt({ publicClient: chain.client, request: { ...r, fromBlock }, pollIntervalMs: 1, blockedRetries: 2 }),
+      ).rejects.toMatchObject({ code: "purchase_ref_blocked" });
+      expect(methodCount(beforeGet, "eth_getLogs")).toBe(0);
+      expect(chain.rpcCalls.length - beforeGet).toBeLessThanOrEqual(30);
+    }
+    // The correct hint still reads paid, and getReceipt/waitForReceipt find the receipt.
+    expect((await readRequest(r, { publicClient: chain.client })).status).toBe("paid");
+    expect((await getReceipt({ publicClient: chain.client, request: r }))?.payer).toBe(payer);
+    expect((await waitForReceipt({ publicClient: chain.client, request: r.url, pollIntervalMs: 1 })).payer).toBe(payer);
+  });
+
+  it("a hint more than 3600 s before issuedAt is invalid; exactly 3600 s is accepted", async () => {
+    chain.mine(1_800n, 3_600n); // 2 s per block
+    const r = await newRequest();
+    chain.emitReceipt(receiptFieldsFor(r));
+    const head = r.fromBlock;
+    expect(chain.timestampOf(head - 1_800n)).toBe(r.quote.issuedAt - 3_600n);
+    expect((await readRequest({ ...r, fromBlock: head - 1_800n }, { publicClient: chain.client })).status).toBe("paid");
+    expect((await readRequest({ ...r, fromBlock: head - 1_801n }, { publicClient: chain.client })).status).toBe("blocked");
+  });
+
+  it("a hint after expiresAt, or past the chain head, is invalid", async () => {
+    chain.emitReceipt(receiptFieldsFor(created));
+    chain.mine(10n, 3_700n);
+    const before = chain.rpcCalls.length;
+    expect((await readRequest({ ...created, fromBlock: chain.blockNumber }, { publicClient: chain.client })).status).toBe("blocked");
+    expect((await readRequest({ ...created, fromBlock: chain.blockNumber + 1_000_000n }, { publicClient: chain.client })).status).toBe("blocked");
+    expect(methodCount(before, "eth_getLogs")).toBe(0);
+  });
+
+  it("caps the scan at maxRanges and reports blocked when exhausted", async () => {
+    chain.mine(3_000n, 3_000n); // receipt lands 3000 blocks after the hint
+    chain.emitReceipt(receiptFieldsFor(created));
+    const before = chain.rpcCalls.length;
+    const capped = await readRequest(created, { publicClient: chain.client, maxBlockRange: 100n, maxRanges: 10 });
+    expect(capped.status).toBe("blocked");
+    expect(methodCount(before, "eth_getLogs")).toBe(10);
+    await expect(getReceipt({ publicClient: chain.client, request: created, maxBlockRange: 100n, maxRanges: 10 })).rejects.toMatchObject({
+      code: "purchase_ref_blocked",
+    });
+    expect((await readRequest(created, { publicClient: chain.client, maxBlockRange: 100n })).status).toBe("paid");
+    expect((await getReceipt({ publicClient: chain.client, request: created, maxBlockRange: 100n }))?.payer).toBe(payer);
+  });
+
+  it("the default cap is 500 ranges", async () => {
+    chain.mine(600n, 600n);
+    chain.emitReceipt(receiptFieldsFor(created));
+    const before = chain.rpcCalls.length;
+    expect((await readRequest(created, { publicClient: chain.client, maxBlockRange: 1n })).status).toBe("blocked");
+    expect(methodCount(before, "eth_getLogs")).toBe(500);
+  });
+});
+
+describe("a link whose metadata names no seller", () => {
+  async function sellerless() {
+    const metadata = structuredClone(created.metadata) as Partial<PaymentRequest["metadata"]>;
+    delete metadata.seller;
+    const quote = { ...created.quote, metadataHash: hashCheckoutMetadata(metadata as PaymentRequest["metadata"]) };
+    const signed = await resign({ ...created, metadata: metadata as PaymentRequest["metadata"], quote });
+    return encodeRequest(signed);
+  }
+
+  it("is rejected with a NotaError by getReceipt, waitForReceipt and payRequest, before and after the ref is consumed", async () => {
+    const url = await sellerless();
+    expect(decodeRequest(url).seller).toBe(zeroAddress);
+    expect((await readRequest(url, { publicClient: chain.client })).status).toBe("tampered");
+    const wallet = createWalletClient({ account: payer, transport: custom({ request: (a) => chain.request(a) }, { retryCount: 0 }) });
+    chain.usdcBalances.set(payer.toLowerCase(), 1_000_000n);
+    for (const consumed of [false, true]) {
+      if (consumed) {
+        const r = decodeRequest(url);
+        chain.emitReceipt({ seller: seller.address, buyer: payer, listingId: r.quote.listingId, purchaseRef: r.quote.purchaseRef, amount: r.quote.amount, metadataHash: r.quote.metadataHash, agentId: r.quote.agentId });
+      }
+      for (const attempt of [
+        getReceipt({ publicClient: chain.client, request: url }),
+        waitForReceipt({ publicClient: chain.client, request: url, pollIntervalMs: 1, timeoutMs: 50 }),
+        payRequest({ walletClient: wallet, publicClient: chain.client, request: url }),
+      ]) {
+        const error = await attempt.catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(NotaError);
+        expect(error).not.toBeInstanceOf(TypeError);
+      }
+    }
+  });
+});
+
 describe("getReceipt / waitForReceipt", () => {
   it("getReceipt is null until paid, then the verified receipt", async () => {
     expect(await getReceipt({ publicClient: chain.client, request: created })).toBeNull();
@@ -575,6 +680,62 @@ describe("payRequest onStep", () => {
     fund();
     const result = await payRequest({ walletClient: wallet(), publicClient: chain.client, request: created.url });
     expect(result.approveTxHash).toBeDefined();
+  });
+});
+
+describe("payRequest after a fresh approval", () => {
+  const wallet = () => createWalletClient({ account: payer, transport: custom({ request: (a) => chain.request(a) }, { retryCount: 0 }) });
+
+  it("retries the purchase simulation while the node serves a stale allowance", async () => {
+    chain.usdcBalances.set(payer.toLowerCase(), 1_000_000n);
+    chain.staleAllowanceCalls = 2;
+    const started = Date.now();
+    const steps: PayStep[] = [];
+    const result = await payRequest({ walletClient: wallet(), publicClient: chain.client, request: created.url, onStep: (s) => steps.push(s) });
+    expect(chain.purchaseSimulations).toBe(3);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1_900);
+    expect(result.approveTxHash).toBeDefined();
+    expect(result.receipt.payer).toBe(payer);
+    expect(steps.map((s) => `${s.step}:${s.state}`)).toEqual([
+      "approve:awaiting_signature",
+      "approve:submitted",
+      "approve:confirmed",
+      "pay:awaiting_signature",
+      "pay:submitted",
+      "pay:confirmed",
+    ]);
+  });
+
+  it("gives up after 5 retries with a NotaError saying the approval succeeded; paying again skips it", { timeout: 20_000 }, async () => {
+    chain.usdcBalances.set(payer.toLowerCase(), 1_000_000n);
+    chain.staleAllowanceCalls = 99;
+    const steps: PayStep[] = [];
+    const error = await payRequest({ walletClient: wallet(), publicClient: chain.client, request: created.url, onStep: (s) => steps.push(s) }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(NotaError);
+    expect(error).toMatchObject({ code: "purchase_simulation_failed" });
+    const approveTxHash = steps.find((s) => s.state === "confirmed")?.txHash;
+    expect((error as NotaError).details).toEqual({ approveTxHash });
+    expect((error as Error).message).toContain(approveTxHash);
+    expect((error as Error).message).toMatch(/approval succeeded/);
+    expect((error as Error).message).toMatch(/Paying again will skip the approval/);
+    expect(chain.purchaseSimulations).toBe(6);
+    expect(steps.some((s) => s.step === "pay")).toBe(false);
+    expect(chain.usdcAllowances.get(payer.toLowerCase())).toBe(100_000n);
+
+    chain.staleAllowanceCalls = 0;
+    const retrySteps: PayStep[] = [];
+    const result = await payRequest({ walletClient: wallet(), publicClient: chain.client, request: created.url, onStep: (s) => retrySteps.push(s) });
+    expect(result.approveTxHash).toBeUndefined();
+    expect(retrySteps[0]).toEqual({ step: "approve", state: "skipped" });
+    expect(result.receipt.amount).toBe(100_000n);
+  });
+
+  it("does not retry when no approval was sent", async () => {
+    chain.usdcBalances.set(payer.toLowerCase(), 1_000_000n);
+    chain.usdcAllowances.set(payer.toLowerCase(), 100_000n);
+    chain.staleAllowanceCalls = 1; // stale value: no prior approval, so 0
+    await expect(payRequest({ walletClient: wallet(), publicClient: chain.client, request: created.url })).rejects.toThrow();
+    expect(chain.purchaseSimulations).toBe(1);
   });
 });
 

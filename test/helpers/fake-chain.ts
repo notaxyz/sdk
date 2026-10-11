@@ -103,10 +103,34 @@ export class FakeChain {
     return signer.toLowerCase() === listing.seller.toLowerCase() || (this.quoteSigners.get(listingId)?.has(signer.toLowerCase()) ?? false);
   }
 
+  /**
+   * Block timestamps. Blocks up to the starting head are "history": one per 12 hours back from the
+   * starting timestamp, so blocks 0 and 1 are years older than any request. Mined blocks are
+   * recorded in segments with their own spacing.
+   */
+  private readonly startBlock = 1_000n;
+  private readonly startTimestamp = 1_800_000_000n;
+  private segments: { first: bigint; last: bigint; lastTimestamp: bigint; secondsPerBlock: bigint }[] = [];
+
   mine(blocks = 1n, seconds = 2n * blocks): void {
+    this.segments.push({ first: this.blockNumber + 1n, last: this.blockNumber + blocks, lastTimestamp: this.timestamp + seconds, secondsPerBlock: seconds / blocks });
     this.blockNumber += blocks;
     this.timestamp += seconds;
   }
+
+  timestampOf(number: bigint): bigint {
+    if (number <= this.startBlock) return this.startTimestamp - (this.startBlock - number) * 43_200n;
+    const segment = this.segments.find((seg) => number >= seg.first && number <= seg.last)!;
+    return segment.lastTimestamp - (segment.last - number) * segment.secondsPerBlock;
+  }
+
+  /** Every JSON-RPC call this chain has served, by method. */
+  rpcCalls: string[] = [];
+  /** Serve the pre-approval allowance to this many upcoming purchase simulations (a lagging RPC node). */
+  staleAllowanceCalls = 0;
+  /** Purchase simulations served (eth_call of purchaseSignedReceipt). */
+  purchaseSimulations = 0;
+  private preApproveAllowance = new Map<string, bigint>();
 
   /** Emit a ReceiptPurchasedV2 log, as a purchase on this store would, and consume the ref. */
   emitReceipt(fields: {
@@ -143,7 +167,8 @@ export class FakeChain {
   }
 
   private block(number: bigint) {
-    const timestamp = this.timestamp - (this.blockNumber - number) * 2n;
+    if (number < 0n || number > this.blockNumber) return null;
+    const timestamp = this.timestampOf(number);
     return {
       number: numberToHex(number),
       hash: `0x${number.toString(16).padStart(64, "0")}`,
@@ -168,6 +193,7 @@ export class FakeChain {
   }
 
   async request({ method, params }: { method: string; params?: unknown }): Promise<unknown> {
+    this.rpcCalls.push(method);
     const p = (params ?? []) as unknown[];
     switch (method) {
       case "eth_chainId":
@@ -259,11 +285,11 @@ export class FakeChain {
     return { listing, signer };
   }
 
-  private async checkPurchase(from: Address, quote: SignedReceiptQuote, signature: Hex, claimedSigner: Address) {
+  private async checkPurchase(from: Address, quote: SignedReceiptQuote, signature: Hex, claimedSigner: Address, allowanceOverride?: bigint) {
     const verified = await this.verifyQuote(quote, signature, from, claimedSigner);
     const payer = from.toLowerCase();
     // Mirrors SafeERC20.safeTransferFrom failing on allowance or balance.
-    if ((this.usdcAllowances.get(payer) ?? 0n) < quote.amount || (this.usdcBalances.get(payer) ?? 0n) < quote.amount) throw new RpcRevert("0x");
+    if ((allowanceOverride ?? this.usdcAllowances.get(payer) ?? 0n) < quote.amount || (this.usdcBalances.get(payer) ?? 0n) < quote.amount) throw new RpcRevert("0x");
     return verified;
   }
 
@@ -283,7 +309,10 @@ export class FakeChain {
     if (target === this.deployment.usdc.toLowerCase()) {
       const { functionName, args } = decodeFunctionData({ abi: erc20Abi, data: tx.data });
       if (functionName !== "approve") throw new Error(`FakeChain: usdc.${functionName} tx not modelled`);
-      if ((args[0] as Address).toLowerCase() === this.deployment.store.toLowerCase()) this.usdcAllowances.set(from.toLowerCase(), args[1] as bigint);
+      if ((args[0] as Address).toLowerCase() === this.deployment.store.toLowerCase()) {
+        this.preApproveAllowance.set(from.toLowerCase(), this.usdcAllowances.get(from.toLowerCase()) ?? 0n);
+        this.usdcAllowances.set(from.toLowerCase(), args[1] as bigint);
+      }
       this.mine();
     } else if (target === this.deployment.store.toLowerCase()) {
       const { functionName, args } = decodeFunctionData({ abi: notaReceiptStoreAbi, data: tx.data });
@@ -413,7 +442,13 @@ export class FakeChain {
       case "purchaseSignedReceipt": {
         // Simulation only: same checks the transaction would make, no state change.
         const [quote, signature, claimedSigner] = args as unknown as [SignedReceiptQuote, Hex, Address];
-        await this.checkPurchase(from, quote, signature, claimedSigner);
+        this.purchaseSimulations++;
+        let stale: bigint | undefined;
+        if (this.staleAllowanceCalls > 0) {
+          this.staleAllowanceCalls--;
+          stale = this.preApproveAllowance.get(from.toLowerCase()) ?? 0n;
+        }
+        await this.checkPurchase(from, quote, signature, claimedSigner, stale);
         return encode(this.nextReceiptId);
       }
       default:
