@@ -2,13 +2,14 @@
  * Fork tests against the real deployed contracts, via a local anvil fork. Nothing is broadcast to
  * the forked network. Skipped (reported as skipped) unless ARBITRUM_RPC_URL / BASE_RPC_URL is set.
  */
-import { createWalletClient, getAddress, http, keccak256, stringToBytes, zeroAddress, zeroHash, type Address, type Chain, type Hex, type WalletClient } from "viem";
+import { createWalletClient, getAddress, http, parseAbi, keccak256, stringToBytes, zeroAddress, zeroHash, type Address, type Chain, type Hex, type WalletClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { arbitrum, base } from "viem/chains";
+import { arbitrum, arbitrumSepolia, base } from "viem/chains";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   NOTA_DEPLOYMENTS,
+  SIGNED_RECEIPT_QUOTE_TYPEHASH,
   createRequest,
   encodeRequest,
   erc20Abi,
@@ -17,6 +18,7 @@ import {
   hashPurchaseRef,
   notaReceiptStoreAbi,
   payRequest,
+  preparePayCalls,
   readRequest,
   setup,
   signedQuoteTypedData,
@@ -32,6 +34,8 @@ const suites: { name: string; chain: Chain; rpcEnv: string; hasAttestReceipt: bo
   { name: "Arbitrum One", chain: arbitrum, rpcEnv: "ARBITRUM_RPC_URL", hasAttestReceipt: true },
   // Base runs the bb6935e build, which predates attestReceipt.
   { name: "Base", chain: base, rpcEnv: "BASE_RPC_URL", hasAttestReceipt: false },
+  // Testnet; same source as Arbitrum One (84ac4f6), including attestReceipt.
+  { name: "Arbitrum Sepolia", chain: arbitrumSepolia, rpcEnv: "ARBITRUM_SEPOLIA_RPC_URL", hasAttestReceipt: true },
 ];
 
 for (const suite of suites) {
@@ -39,7 +43,7 @@ for (const suite of suites) {
 
   // Public RPCs can be slow to serve fork state on first touch.
   describe.skipIf(!forkUrl)(`fork: ${suite.name}`, { timeout: 120_000 }, () => {
-    const deployment: NotaDeployment = NOTA_DEPLOYMENTS[suite.chain.id as 42161 | 8453];
+    const deployment: NotaDeployment = NOTA_DEPLOYMENTS[suite.chain.id as 42161 | 8453 | 421614];
     const sellerAccount = privateKeyToAccount(generatePrivateKey());
     const strangerAccount = privateKeyToAccount(generatePrivateKey());
     const payer: Address = getAddress("0x00000000000000000000000000000000fa1d0001");
@@ -87,11 +91,18 @@ for (const suite of suites) {
       await fork?.stop();
     });
 
-    it("store immutables match the address table", async () => {
-      const read = (functionName: "SETTLEMENT_TOKEN" | "PURCHASE_REF_REGISTRY") =>
+    it("store immutables, EIP-712 domain and quote typehash match the SDK", async () => {
+      const read = (functionName: "SETTLEMENT_TOKEN" | "PURCHASE_REF_REGISTRY" | "SIGNED_RECEIPT_QUOTE_TYPEHASH") =>
         fork.publicClient.readContract({ address: deployment.store, abi: notaReceiptStoreAbi, functionName });
       expect((await read("SETTLEMENT_TOKEN")).toLowerCase()).toBe(deployment.usdc.toLowerCase());
       expect((await read("PURCHASE_REF_REGISTRY")).toLowerCase()).toBe(deployment.registry.toLowerCase());
+      expect(await read("SIGNED_RECEIPT_QUOTE_TYPEHASH")).toBe(SIGNED_RECEIPT_QUOTE_TYPEHASH);
+      const [, name, version, chainId, verifyingContract] = await fork.publicClient.readContract({
+        address: deployment.store,
+        abi: parseAbi(["function eip712Domain() view returns (bytes1, string, string, uint256, address, bytes32, uint256[])"]),
+        functionName: "eip712Domain",
+      });
+      expect([name, version, chainId, verifyingContract]).toEqual(["NotaReceiptStore", "2", BigInt(deployment.chainId), deployment.store]);
     });
 
     it("setup creates a SignedQuoteOnly listing owned by the seller", async () => {
@@ -151,6 +162,22 @@ for (const suite of suites) {
       const result = await payRequest({ walletClient: payer2Wallet, publicClient: fork.publicClient, request: r.url });
       expect(result.approveTxHash).toBeUndefined();
       expect(result.receipt.amount).toBe(250n);
+    });
+
+    it("preparePayCalls output, sent as-is, pays the request (what a smart account would batch)", async () => {
+      const r = await request({ amount: 777n });
+      const { calls, needsApproval } = await preparePayCalls({ publicClient: fork.publicClient, request: r.url, payer: payer2 });
+      expect(needsApproval).toBe(true);
+      expect(calls).toHaveLength(2);
+      const sellerBefore = await usdcBalance(sellerAccount.address);
+      for (const call of calls) {
+        const hash = await payer2Wallet.sendTransaction({ chain: suite.chain, account: payer2, to: call.to, data: call.data });
+        expect((await fork.publicClient.waitForTransactionReceipt({ hash })).status).toBe("success");
+      }
+      expect((await usdcBalance(sellerAccount.address)) - sellerBefore).toBe(777n);
+      const read = await readRequest(r.url, { publicClient: fork.publicClient });
+      expect(read.status).toBe("paid");
+      expect(read.receipt?.payer).toBe(payer2);
     });
 
     it("an expired link is refused", async () => {

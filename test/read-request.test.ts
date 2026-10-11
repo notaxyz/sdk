@@ -1,4 +1,4 @@
-import { createWalletClient, custom, getAddress, type Hex } from "viem";
+import { createWalletClient, custom, decodeFunctionData, getAddress, zeroAddress, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -6,9 +6,12 @@ import {
   createRequest,
   decodeRequest,
   encodeRequest,
+  erc20Abi,
   getReceipt,
   isNotaError,
+  notaReceiptStoreAbi,
   payRequest,
+  preparePayCalls,
   readRequest,
   signedQuoteTypedData,
   toLinkPayload,
@@ -120,6 +123,26 @@ describe("createRequest", () => {
     chain.listings.get(listingId)!.active = false;
     await expect(newRequest()).rejects.toMatchObject({ code: "listing_inactive" });
     await expect(newRequest({ listingId: 99n })).rejects.toMatchObject({ code: "listing_not_found" });
+  });
+
+  it("checks the store's quote typehash", async () => {
+    const bad = new FakeChain();
+    bad.addListing(seller.address);
+    bad.typehashOverride = `0x${"00".repeat(32)}`;
+    await expect(
+      createRequest({ account: seller, publicClient: bad.client, listingId: 1n, amount: 100n, purpose: "x" }),
+    ).rejects.toMatchObject({ code: "deployment_mismatch" });
+  });
+
+  it("works on Arbitrum Sepolia", async () => {
+    const sepolia = new FakeChain(421614);
+    const id = sepolia.addListing(seller.address);
+    const r = await createRequest({ account: seller, publicClient: sepolia.client, listingId: id, amount: 100n, purpose: "testnet" });
+    expect(r.chainId).toBe(421614);
+    expect(r.store).toBe("0x6b13e2077c84e1326111acBbb618E028723e2EA2");
+    expect(r.metadata.protocol.settlementToken).toBe("0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d");
+    expect((await readRequest(r.url, { publicClient: sepolia.client })).status).toBe("payable");
+    expect((await readRequest(r.url, { publicClient: chain.client })).status).toBe("wrong_chain");
   });
 
   it("checks the store's immutables against the address table", async () => {
@@ -327,6 +350,50 @@ describe("getReceipt / waitForReceipt", () => {
   });
 });
 
+describe("preparePayCalls", () => {
+  it("returns an exact-amount approve then the purchase when the allowance is short", async () => {
+    chain.usdcBalances.set(payer.toLowerCase(), 100_000n);
+    chain.usdcAllowances.set(payer.toLowerCase(), 99_999n);
+    const { calls, needsApproval } = await preparePayCalls({ publicClient: chain.client, request: created.url, payer });
+    expect(needsApproval).toBe(true);
+    expect(calls.map((c) => c.to)).toEqual([chain.deployment.usdc, chain.deployment.store]);
+    const approve = decodeFunctionData({ abi: erc20Abi, data: calls[0]!.data });
+    expect(approve.functionName).toBe("approve");
+    expect(approve.args).toEqual([chain.deployment.store, 100_000n]);
+    const purchase = decodeFunctionData({ abi: notaReceiptStoreAbi, data: calls[1]!.data });
+    expect(purchase.functionName).toBe("purchaseSignedReceipt");
+    expect(purchase.args).toEqual([created.quote, created.signature, zeroAddress]);
+    expect(Object.keys(calls[0]!).sort()).toEqual(["data", "to"]);
+  });
+
+  it("returns only the purchase when the allowance already covers the amount", async () => {
+    chain.usdcBalances.set(payer.toLowerCase(), 100_000n);
+    chain.usdcAllowances.set(payer.toLowerCase(), 100_000n);
+    const { calls, needsApproval } = await preparePayCalls({ publicClient: chain.client, request: created, payer });
+    expect(needsApproval).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.to).toBe(chain.deployment.store);
+  });
+
+  it("checks the payer's balance", async () => {
+    chain.usdcBalances.set(payer.toLowerCase(), 99_999n);
+    await expect(preparePayCalls({ publicClient: chain.client, request: created, payer })).rejects.toMatchObject({ code: "insufficient_balance" });
+  });
+
+  it("refuses anything readRequest does not call payable", async () => {
+    chain.usdcBalances.set(payer.toLowerCase(), 100_000n);
+    chain.consumed.add(created.quote.purchaseRef);
+    await expect(preparePayCalls({ publicClient: chain.client, request: created, payer })).rejects.toMatchObject({
+      code: "not_payable",
+      details: { status: "blocked" },
+    });
+    const tampered = { ...created, quote: { ...created.quote, amount: 5_000n } };
+    await expect(preparePayCalls({ publicClient: chain.client, request: tampered, payer })).rejects.toMatchObject({
+      details: { status: "tampered" },
+    });
+  });
+});
+
 describe("payRequest", () => {
   const walletFor = () => createWalletClient({ account: privateKeyToAccount(generatePrivateKey()), transport: custom({ request: (a) => chain.request(a) }, { retryCount: 0 }) });
 
@@ -340,6 +407,14 @@ describe("payRequest", () => {
     const error = await payRequest({ walletClient: walletFor(), publicClient: chain.client, request: created.url }).catch((e) => e);
     expect(isNotaError(error, "not_payable")).toBe(true);
     expect(error.details.status).toBe(status);
+  });
+
+  it("preparePayCalls refuses the same way", async () => {
+    chain.emitReceipt(receiptFieldsFor(created));
+    await expect(preparePayCalls({ publicClient: chain.client, request: created.url, payer })).rejects.toMatchObject({
+      code: "not_payable",
+      details: { status: "paid" },
+    });
   });
 
   it("refuses a tampered link", async () => {

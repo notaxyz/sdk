@@ -1,4 +1,4 @@
-import { parseEventLogs, zeroAddress, type Hex, type PublicClient, type WalletClient } from "viem";
+import { encodeFunctionData, parseEventLogs, zeroAddress, type Address, type Hex, type PublicClient, type WalletClient } from "viem";
 
 import { erc20Abi, notaReceiptStoreAbi } from "./abi.js";
 import { assertDeployment } from "./deployment.js";
@@ -6,7 +6,85 @@ import { NotaError } from "./errors.js";
 import { assertWalletChain, requireAccount, sameAddress } from "./chain.js";
 import { matchesRequest, receiptFromLog, type RequestInput } from "./receipt.js";
 import { readRequest } from "./request.js";
-import type { NotaReceipt } from "./types.js";
+import type { NotaReceipt, PaymentRequest } from "./types.js";
+
+export interface PayCall {
+  to: Address;
+  data: Hex;
+}
+
+export interface PreparePayCallsParams {
+  publicClient: PublicClient;
+  /** The link, or a decoded request. */
+  request: RequestInput;
+  /** The account that will send the calls: an EOA, or a smart account that batches them. */
+  payer: Address;
+}
+
+export interface PreparedPayCalls {
+  /**
+   * In order: USDC `approve(store, amount)` for exactly the quoted amount, present only when the
+   * payer's allowance is short, then `purchaseSignedReceipt(quote, signature, address(0))`.
+   * Both send zero value. A smart account can batch them into one operation.
+   */
+  calls: PayCall[];
+  needsApproval: boolean;
+}
+
+interface PreparedPayment extends PreparedPayCalls {
+  request: PaymentRequest;
+}
+
+async function preparePayment(params: PreparePayCallsParams): Promise<PreparedPayment> {
+  const { publicClient, payer } = params;
+
+  const read = await readRequest(params.request, { publicClient, payer });
+  if (read.status !== "payable") {
+    throw new NotaError("not_payable", `Refusing to pay: request status is "${read.status}"${read.reason ? ` (${read.reason})` : ""}`, {
+      status: read.status,
+    });
+  }
+  const { request } = read;
+  const { quote } = request;
+  const deployment = await assertDeployment(publicClient);
+
+  const [paused, balance, allowance] = await Promise.all([
+    publicClient.readContract({ address: deployment.store, abi: notaReceiptStoreAbi, functionName: "purchasesPaused" }),
+    publicClient.readContract({ address: deployment.usdc, abi: erc20Abi, functionName: "balanceOf", args: [payer] }),
+    publicClient.readContract({ address: deployment.usdc, abi: erc20Abi, functionName: "allowance", args: [payer, deployment.store] }),
+  ]);
+  if (paused) throw new NotaError("purchases_paused", "Purchases are paused on the Nota store");
+  if (balance < quote.amount) {
+    throw new NotaError("insufficient_balance", `${payer} holds ${balance} USDC base units, needs ${quote.amount}`, {
+      balance,
+      amount: quote.amount,
+    });
+  }
+
+  const needsApproval = allowance < quote.amount;
+  const calls: PayCall[] = [];
+  if (needsApproval) {
+    calls.push({
+      to: deployment.usdc,
+      data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [deployment.store, quote.amount] }),
+    });
+  }
+  calls.push({
+    to: deployment.store,
+    data: encodeFunctionData({ abi: notaReceiptStoreAbi, functionName: "purchaseSignedReceipt", args: [quote, request.signature, zeroAddress] }),
+  });
+  return { calls, needsApproval, request };
+}
+
+/**
+ * The calls that pay a request, without sending anything. Runs `readRequest` first and refuses
+ * anything that is not "payable", and checks the payer's USDC balance. The approval, when
+ * present, is for exactly the quoted amount, never unlimited.
+ */
+export async function preparePayCalls(params: PreparePayCallsParams): Promise<PreparedPayCalls> {
+  const { calls, needsApproval } = await preparePayment(params);
+  return { calls, needsApproval };
+}
 
 export interface PayRequestParams {
   walletClient: WalletClient;
@@ -25,9 +103,8 @@ export interface PayRequestResult {
 }
 
 /**
- * Pay a request from the wallet's account. Refuses anything `readRequest` does not call
- * "payable". Approves exactly the quoted amount (never unlimited) and skips the approval when
- * the existing allowance already covers it. Funds go to the seller in the purchase transaction.
+ * Pay a request from the wallet's account by sending the calls from `preparePayCalls` one at a
+ * time. Funds go to the seller in the purchase transaction.
  */
 export async function payRequest(params: PayRequestParams): Promise<PayRequestResult> {
   const { walletClient, publicClient } = params;
@@ -35,80 +112,32 @@ export async function payRequest(params: PayRequestParams): Promise<PayRequestRe
   const account = requireAccount(walletClient);
   const payer = account.address;
 
-  const read = await readRequest(params.request, { publicClient, payer });
-  if (read.status !== "payable") {
-    throw new NotaError("not_payable", `Refusing to pay: request status is "${read.status}"${read.reason ? ` (${read.reason})` : ""}`, {
-      status: read.status,
-    });
-  }
-  const { request } = read;
-  const { quote } = request;
+  const { calls, needsApproval, request } = await preparePayment({ publicClient, request: params.request, payer });
   const deployment = await assertDeployment(publicClient);
   await assertWalletChain(walletClient, deployment.chainId);
-
-  const paused = await publicClient.readContract({ address: deployment.store, abi: notaReceiptStoreAbi, functionName: "purchasesPaused" });
-  if (paused) throw new NotaError("purchases_paused", "Purchases are paused on the Nota store");
-
-  const balance = await publicClient.readContract({ address: deployment.usdc, abi: erc20Abi, functionName: "balanceOf", args: [payer] });
-  if (balance < quote.amount) {
-    throw new NotaError("insufficient_balance", `${payer} holds ${balance} USDC base units, needs ${quote.amount}`, {
-      balance,
-      amount: quote.amount,
-    });
-  }
-
   const chain = walletClient.chain ?? null;
-  let approveTxHash: Hex | undefined;
-  const allowance = await publicClient.readContract({
-    address: deployment.usdc,
-    abi: erc20Abi,
-    functionName: "allowance",
-    args: [payer, deployment.store],
-  });
-  if (allowance < quote.amount) {
-    await publicClient.simulateContract({
-      account,
-      address: deployment.usdc,
-      abi: erc20Abi,
-      functionName: "approve",
-      args: [deployment.store, quote.amount],
-    });
-    approveTxHash = await walletClient.writeContract({
-      account,
-      chain,
-      address: deployment.usdc,
-      abi: erc20Abi,
-      functionName: "approve",
-      args: [deployment.store, quote.amount],
-    });
-    const approval = await publicClient.waitForTransactionReceipt({ hash: approveTxHash, confirmations });
-    if (approval.status !== "success") {
-      throw new NotaError("transaction_failed", `USDC approve transaction ${approveTxHash} reverted`, { txHash: approveTxHash });
+
+  const hashes: Hex[] = [];
+  for (const call of calls) {
+    // Simulate each call right before sending it, so a revert surfaces before it costs gas.
+    await publicClient.call({ account, to: call.to, data: call.data });
+    const hash = await walletClient.sendTransaction({ account, chain, to: call.to, data: call.data });
+    const txReceipt = await publicClient.waitForTransactionReceipt({ hash, confirmations });
+    if (txReceipt.status !== "success") {
+      throw new NotaError("transaction_failed", `Transaction ${hash} to ${call.to} reverted`, { txHash: hash });
+    }
+    hashes.push(hash);
+    if (call === calls[calls.length - 1]) {
+      const logs = parseEventLogs({ abi: notaReceiptStoreAbi, eventName: "ReceiptPurchasedV2", logs: txReceipt.logs });
+      for (const log of logs) {
+        if (!sameAddress(log.address, deployment.store)) continue;
+        const receipt = receiptFromLog(log, deployment.chainId);
+        if (receipt && matchesRequest(receipt, request, request.metadata.seller) && sameAddress(receipt.payer, payer)) {
+          return { ...(needsApproval ? { approveTxHash: hashes[0] } : {}), payTxHash: hash, receipt };
+        }
+      }
+      throw new NotaError("receipt_mismatch", `Transaction ${hash} succeeded but emitted no matching ReceiptPurchasedV2`, { txHash: hash });
     }
   }
-
-  const args = [quote, request.signature, zeroAddress] as const;
-  await publicClient.simulateContract({ account, address: deployment.store, abi: notaReceiptStoreAbi, functionName: "purchaseSignedReceipt", args });
-  const payTxHash = await walletClient.writeContract({
-    account,
-    chain,
-    address: deployment.store,
-    abi: notaReceiptStoreAbi,
-    functionName: "purchaseSignedReceipt",
-    args,
-  });
-  const txReceipt = await publicClient.waitForTransactionReceipt({ hash: payTxHash, confirmations });
-  if (txReceipt.status !== "success") {
-    throw new NotaError("transaction_failed", `purchaseSignedReceipt transaction ${payTxHash} reverted`, { txHash: payTxHash });
-  }
-
-  const logs = parseEventLogs({ abi: notaReceiptStoreAbi, eventName: "ReceiptPurchasedV2", logs: txReceipt.logs });
-  for (const log of logs) {
-    if (!sameAddress(log.address, deployment.store)) continue;
-    const receipt = receiptFromLog(log, deployment.chainId);
-    if (receipt && matchesRequest(receipt, request, request.metadata.seller) && sameAddress(receipt.payer, payer)) {
-      return { ...(approveTxHash ? { approveTxHash } : {}), payTxHash, receipt };
-    }
-  }
-  throw new NotaError("receipt_mismatch", `Transaction ${payTxHash} succeeded but emitted no matching ReceiptPurchasedV2`, { txHash: payTxHash });
+  throw new NotaError("transaction_failed", "No purchase call was prepared");
 }

@@ -8,7 +8,15 @@ export {
   type CreateRequestParams,
   type ReadRequestOptions,
 } from "./request.js";
-export { payRequest, type PayRequestParams, type PayRequestResult } from "./pay.js";
+export {
+  payRequest,
+  preparePayCalls,
+  type PayRequestParams,
+  type PayRequestResult,
+  type PreparePayCallsParams,
+  type PreparedPayCalls,
+  type PayCall,
+} from "./pay.js";
 export {
   getReceipt,
   waitForReceipt,
@@ -27,6 +35,7 @@ export {
   SUPPORTED_CHAIN_IDS,
   EIP712_DOMAIN_NAME,
   EIP712_DOMAIN_VERSION,
+  SIGNED_RECEIPT_QUOTE_TYPEHASH,
   USDC_DECIMALS,
   getDeployment,
   isSupportedChainId,
