@@ -38,6 +38,29 @@ jobs:
           BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
           ARBITRUM_SEPOLIA_RPC_URL: ${{ secrets.ARBITRUM_SEPOLIA_RPC_URL }}
       - run: npm run build
-      - run: npm publish --provenance --access public
+      # Lets a tag be pushed after publishing from a laptop: if this exact version is already on
+      # npm, the publish step is skipped and the run still succeeds.
+      - name: Check whether this version is already on npm
+        id: npm_version
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          # Prints the version if it exists; prints nothing (or 404s when the package has never been
+          # published) otherwise. Any other failure falls through to the publish step, which then
+          # fails on its own if the version does exist.
+          existing="$(npm view "${name}@${version}" version 2>/dev/null || true)"
+          if [ "${existing}" = "${version}" ]; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "${name}@${version} is already published on npm; skipping the publish step."
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            echo "${name}@${version} is not on npm yet; publishing."
+          fi
+      - name: Publish
+        if: steps.npm_version.outputs.already_published != 'true'
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Skipped publish
+        if: steps.npm_version.outputs.already_published == 'true'
+        run: echo "::notice title=Publish skipped::$(node -p "require('./package.json').name")@$(node -p "require('./package.json').version") was already on npm; nothing was published."
