@@ -1,4 +1,4 @@
-import { getAddress, isAddress, type Address, type Hex } from "viem";
+import { getAddress, isAddress, zeroAddress, type Address, type Hex } from "viem";
 
 import { NotaError } from "./errors.js";
 import type { CheckoutMetadata, PaymentRequest, SignedReceiptQuote } from "./types.js";
@@ -34,6 +34,8 @@ export interface LinkPayload {
   };
   signature: Hex;
   metadata: CheckoutMetadata;
+  /** Present only when the quote was signed by an authorized signer rather than the seller. */
+  signer?: Address;
   fromBlock?: string;
 }
 
@@ -58,6 +60,8 @@ export function toLinkPayload(request: PaymentRequest): LinkPayload {
     signature: request.signature,
     metadata: request.metadata,
   };
+  const seller = sellerOf(request.metadata);
+  if (request.signer !== undefined && request.signer.toLowerCase() !== seller.toLowerCase()) payload.signer = request.signer;
   if (request.fromBlock !== undefined) payload.fromBlock = request.fromBlock.toString();
   return payload;
 }
@@ -134,9 +138,12 @@ function fromLinkPayload(payload: LinkPayload): PaymentRequest {
     issuedAt: BigInt(q.issuedAt),
     expiresAt: BigInt(q.expiresAt),
   };
+  const seller = sellerOf(payload.metadata);
   const request: PaymentRequest = {
     chainId: payload.chainId,
     store: payload.store,
+    seller,
+    signer: payload.signer ?? seller,
     quote,
     signature: payload.signature,
     metadata: payload.metadata,
@@ -145,7 +152,16 @@ function fromLinkPayload(payload: LinkPayload): PaymentRequest {
   return request;
 }
 
-const TOP_LEVEL_KEYS = new Set(["v", "chainId", "store", "quote", "signature", "metadata", "fromBlock"]);
+const TOP_LEVEL_KEYS = new Set(["v", "chainId", "store", "quote", "signature", "metadata", "signer", "fromBlock"]);
+
+/**
+ * The seller named in the (signed) metadata. A missing or malformed value yields the zero
+ * address; `readRequest` reports such a request as tampered.
+ */
+function sellerOf(metadata: unknown): Address {
+  const seller = (metadata as { seller?: unknown } | null)?.seller;
+  return typeof seller === "string" && isAddress(seller, { strict: false }) ? getAddress(seller) : zeroAddress;
+}
 const QUOTE_KEYS = [
   "listingId",
   "buyer",
@@ -205,6 +221,11 @@ export function parseLinkPayload(value: unknown): LinkPayload {
     signature: signature.toLowerCase() as Hex,
     metadata: metadata as unknown as CheckoutMetadata,
   };
+  if (value.signer !== undefined) {
+    const signer = address(value.signer, "signer");
+    if (signer === zeroAddress) throw invalid("signer must not be the zero address");
+    payload.signer = signer;
+  }
   if (value.fromBlock !== undefined) payload.fromBlock = decimal(value.fromBlock, "fromBlock", MAX_UINT64);
   return payload;
 }

@@ -6,6 +6,7 @@ export type NotaErrorCode =
   | "listing_not_found"
   | "listing_inactive"
   | "not_listing_seller"
+  | "not_authorized_signer"
   | "not_payable"
   | "insufficient_balance"
   | "purchases_paused"

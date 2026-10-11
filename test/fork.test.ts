@@ -10,6 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   NOTA_DEPLOYMENTS,
   SIGNED_RECEIPT_QUOTE_TYPEHASH,
+  authorizeSigner,
   createRequest,
   encodeRequest,
   erc20Abi,
@@ -20,6 +21,7 @@ import {
   payRequest,
   preparePayCalls,
   readRequest,
+  revokeSigner,
   setup,
   signedQuoteTypedData,
   waitForReceipt,
@@ -178,6 +180,55 @@ for (const suite of suites) {
       const read = await readRequest(r.url, { publicClient: fork.publicClient });
       expect(read.status).toBe("paid");
       expect(read.receipt?.payer).toBe(payer2);
+    });
+
+    describe("authorized quote signer", () => {
+      const delegate = privateKeyToAccount(generatePrivateKey());
+
+      it("seller authorizes a signer; the signer's request is paid to the seller, not the signer", async () => {
+        await expect(request({ account: delegate })).rejects.toMatchObject({ code: "not_authorized_signer" });
+        await authorizeSigner({ walletClient: sellerWallet, publicClient: fork.publicClient, listingId, signer: delegate.address });
+        const authorized = await fork.publicClient.readContract({
+          address: deployment.store,
+          abi: notaReceiptStoreAbi,
+          functionName: "isQuoteSignerAuthorized",
+          args: [listingId, delegate.address],
+        });
+        expect(authorized).toBe(true);
+
+        const r = await request({ account: delegate, amount: 1_000n });
+        const read = await readRequest(r.url, { publicClient: fork.publicClient });
+        expect(read.status).toBe("payable");
+        expect(read.request.seller).toBe(sellerAccount.address);
+        expect(read.request.signer).toBe(delegate.address);
+
+        const [sellerBefore, signerBefore, storeBefore] = await Promise.all([usdcBalance(sellerAccount.address), usdcBalance(delegate.address), usdcBalance(deployment.store)]);
+        const result = await payRequest({ walletClient: payer2Wallet, publicClient: fork.publicClient, request: r.url });
+        expect((await usdcBalance(sellerAccount.address)) - sellerBefore).toBe(1_000n);
+        expect(await usdcBalance(delegate.address)).toBe(signerBefore);
+        expect(await usdcBalance(deployment.store)).toBe(storeBefore);
+        expect(result.receipt.seller).toBe(sellerAccount.address);
+        expect(result.receipt.payer).toBe(payer2);
+        expect((await readRequest(r.url, { publicClient: fork.publicClient })).status).toBe("paid");
+      });
+
+      it("a revoked signer's request reads invalid_signature and is refused", async () => {
+        const r = await request({ account: delegate, amount: 1_000n });
+        expect((await readRequest(r.url, { publicClient: fork.publicClient })).status).toBe("payable");
+        await revokeSigner({ walletClient: sellerWallet, publicClient: fork.publicClient, listingId, signer: delegate.address });
+        expect((await readRequest(r.url, { publicClient: fork.publicClient })).status).toBe("invalid_signature");
+        await expect(payRequest({ walletClient: payer2Wallet, publicClient: fork.publicClient, request: r.url })).rejects.toMatchObject({
+          code: "not_payable",
+          details: { status: "invalid_signature" },
+        });
+        await expect(request({ account: delegate })).rejects.toMatchObject({ code: "not_authorized_signer" });
+      });
+
+      it("only the seller can authorize signers", async () => {
+        await expect(
+          authorizeSigner({ walletClient: strangerWallet, publicClient: fork.publicClient, listingId, signer: delegate.address }),
+        ).rejects.toMatchObject({ code: "not_listing_seller" });
+      });
     });
 
     it("an expired link is refused", async () => {

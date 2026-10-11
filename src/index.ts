@@ -1,4 +1,5 @@
 export { setup, prepareSetup, type SetupParams, type PreparedSetup } from "./setup.js";
+export { authorizeSigner, revokeSigner, type SignerParams } from "./signers.js";
 export {
   createRequest,
   readRequest,

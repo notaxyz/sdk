@@ -52,6 +52,18 @@ export interface CheckoutMetadata {
 export interface PaymentRequest {
   chainId: number;
   store: Address;
+  /**
+   * The listing's seller: who gets paid. Taken from the signed metadata; `readRequest` checks it
+   * against the on-chain listing.
+   */
+  seller: Address;
+  /**
+   * Who signed the quote: the seller, or a quote signer the seller authorized for this listing.
+   * Carried in the link only when it differs from the seller, and passed to the contract as
+   * `claimedSigner`. Not covered by the signature, but a wrong value only makes the signature
+   * fail to verify.
+   */
+  signer: Address;
   quote: SignedReceiptQuote;
   signature: Hex;
   metadata: CheckoutMetadata;

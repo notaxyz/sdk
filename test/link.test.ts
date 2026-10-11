@@ -3,9 +3,12 @@ import { describe, expect, it } from "vitest";
 
 import { decodeRequest, encodeRequest, toLinkPayload, type PaymentRequest } from "../src/index.js";
 
+const SELLER = privateKeyToAccount(`0x${"01".repeat(32)}`).address;
 const sample: PaymentRequest = {
   chainId: 42161,
   store: "0xf6062F3F52D3E19cb9cc3e027491a5c11D101F88",
+  seller: SELLER,
+  signer: SELLER,
   quote: {
     listingId: 12n,
     buyer: "0x0000000000000000000000000000000000000000",
@@ -28,7 +31,7 @@ const sample: PaymentRequest = {
       receiptStore: "0xf6062F3F52D3E19cb9cc3e027491a5c11D101F88",
       settlementToken: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
     },
-    seller: privateKeyToAccount(`0x${"01".repeat(32)}`).address,
+    seller: SELLER,
     listing: { listingId: "12", listingHash: `0x${"33".repeat(32)}` },
     quote: {
       buyer: "0x0000000000000000000000000000000000000000",
@@ -74,6 +77,16 @@ describe("link format", () => {
     expect(json.fromBlock).toBe("513536720");
   });
 
+  it("carries signer only when it differs from the seller", () => {
+    const json = (r: PaymentRequest) => JSON.parse(Buffer.from(encodeRequest(r).split("#r=")[1]!, "base64url").toString("utf8"));
+    expect(json(sample).signer).toBeUndefined();
+    const other = privateKeyToAccount(`0x${"02".repeat(32)}`).address;
+    const delegated = { ...sample, signer: other };
+    expect(json(delegated).signer).toBe(other);
+    expect(decodeRequest(encodeRequest(delegated))).toEqual(delegated);
+    expect(decodeRequest({ ...sample, seller: other })).toEqual(sample); // seller always comes from the signed metadata
+  });
+
   it("omits fromBlock when absent", () => {
     const { fromBlock: _drop, ...noHint } = sample;
     const decoded = decodeRequest(encodeRequest(noHint));
@@ -96,6 +109,8 @@ describe("link format", () => {
       { ...payload, signature: "0xabc" },
       { ...payload, metadata: "x" },
       { ...payload, fromBlock: 5 },
+      { ...payload, signer: "0x1234" },
+      { ...payload, signer: "0x0000000000000000000000000000000000000000" },
       { ...payload, quote: { ...payload.quote, amount: "-1" } },
       { ...payload, quote: { ...payload.quote, amount: "01" } },
       { ...payload, quote: { ...payload.quote, amount: 5 } },

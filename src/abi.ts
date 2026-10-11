@@ -20,10 +20,14 @@ export const notaReceiptStoreAbi = parseAbi([
   "function EIP712_NAME() view returns (string)",
   "function EIP712_VERSION() view returns (string)",
   "function SIGNED_RECEIPT_QUOTE_TYPEHASH() view returns (bytes32)",
+  "function isQuoteSignerAuthorized(uint256 listingId, address signer) view returns (bool)",
+  "function setListingQuoteSigner(uint256 listingId, address signer, bool authorized)",
+  "function quoteSignerUpdatesPaused() view returns (bool)",
   "function purchasesPaused() view returns (bool)",
   "function listingCreationPaused() view returns (bool)",
 
   "event ListingCreated(uint256 indexed listingId, address indexed seller, bytes32 indexed listingHash, uint256 unitPrice, uint8 mode)",
+  "event QuoteSignerAuthorizationChanged(uint256 indexed listingId, address indexed seller, address indexed signer, bool authorized)",
   "event ReceiptPurchasedV2(uint256 receiptId, address indexed seller, address indexed buyer, uint256 listingId, bytes32 indexed purchaseRef, uint256 amount, bytes32 metadataHash, bytes32 agentId)",
 
   "error ListingNotFound()",

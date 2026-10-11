@@ -3,6 +3,7 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  authorizeSigner,
   createRequest,
   decodeRequest,
   encodeRequest,
@@ -13,6 +14,7 @@ import {
   payRequest,
   preparePayCalls,
   readRequest,
+  revokeSigner,
   signedQuoteTypedData,
   toLinkPayload,
   waitForReceipt,
@@ -119,7 +121,7 @@ describe("createRequest", () => {
   });
 
   it("refuses to sign for someone else's or an inactive listing", async () => {
-    await expect(newRequest({ account: stranger })).rejects.toMatchObject({ code: "not_listing_seller" });
+    await expect(newRequest({ account: stranger })).rejects.toMatchObject({ code: "not_authorized_signer" });
     chain.listings.get(listingId)!.active = false;
     await expect(newRequest()).rejects.toMatchObject({ code: "listing_inactive" });
     await expect(newRequest({ listingId: 99n })).rejects.toMatchObject({ code: "listing_not_found" });
@@ -152,6 +154,94 @@ describe("createRequest", () => {
     await expect(
       createRequest({ account: seller, publicClient: bad.client, listingId: 1n, amount: 100n, purpose: "x" }),
     ).rejects.toMatchObject({ code: "deployment_mismatch" });
+  });
+});
+
+describe("authorized quote signers", () => {
+  const delegate = privateKeyToAccount(generatePrivateKey());
+  const viaDelegate = () => newRequest({ account: delegate });
+
+  it("an authorized signer can issue requests; the seller is still who gets paid", async () => {
+    chain.authorizeSigner(listingId, delegate.address);
+    const r = await viaDelegate();
+    expect(r.seller).toBe(seller.address);
+    expect(r.signer).toBe(delegate.address);
+    expect(r.metadata.seller).toBe(seller.address);
+    const read = await readRequest(r.url, { publicClient: chain.client });
+    expect(read.status).toBe("payable");
+    expect(read.request.seller).toBe(seller.address);
+    expect(read.request.signer).toBe(delegate.address);
+    // Requests the seller signs carry no signer field and use claimedSigner = 0.
+    expect((await readRequest(created.url, { publicClient: chain.client })).request.signer).toBe(seller.address);
+  });
+
+  it("an unauthorized signer is refused before signing", async () => {
+    await expect(viaDelegate()).rejects.toMatchObject({ code: "not_authorized_signer" });
+  });
+
+  it("a revoked signer's request reads invalid_signature", async () => {
+    chain.authorizeSigner(listingId, delegate.address);
+    const r = await viaDelegate();
+    chain.authorizeSigner(listingId, delegate.address, false);
+    expect((await readRequest(r.url, { publicClient: chain.client })).status).toBe("invalid_signature");
+  });
+
+  it("a paid request stays paid after its signer is revoked", async () => {
+    chain.authorizeSigner(listingId, delegate.address);
+    const r = await viaDelegate();
+    chain.emitReceipt(receiptFieldsFor(r));
+    chain.authorizeSigner(listingId, delegate.address, false);
+    expect((await readRequest(r.url, { publicClient: chain.client })).status).toBe("paid");
+  });
+
+  it("a mismatched signer field reads invalid_signature", async () => {
+    const other = privateKeyToAccount(generatePrivateKey());
+    chain.authorizeSigner(listingId, delegate.address);
+    chain.authorizeSigner(listingId, other.address);
+    const r = await viaDelegate();
+    // Signer dropped: the contract would check the signature against the seller.
+    expect((await readRequest({ ...r, signer: seller.address }, { publicClient: chain.client })).status).toBe("invalid_signature");
+    // Signer swapped for another authorized signer.
+    expect((await readRequest({ ...r, signer: other.address }, { publicClient: chain.client })).status).toBe("invalid_signature");
+    // The seller's own request with a signer field naming an authorized delegate.
+    expect((await readRequest({ ...created, signer: delegate.address }, { publicClient: chain.client })).status).toBe("invalid_signature");
+  });
+
+  it("preparePayCalls passes the signer as claimedSigner", async () => {
+    chain.authorizeSigner(listingId, delegate.address);
+    chain.usdcBalances.set(payer.toLowerCase(), 100_000n);
+    const r = await viaDelegate();
+    const { calls } = await preparePayCalls({ publicClient: chain.client, request: r.url, payer });
+    const purchase = decodeFunctionData({ abi: notaReceiptStoreAbi, data: calls.at(-1)!.data });
+    expect(purchase.args?.[2]).toBe(delegate.address);
+    const own = await preparePayCalls({ publicClient: chain.client, request: created.url, payer });
+    expect(decodeFunctionData({ abi: notaReceiptStoreAbi, data: own.calls.at(-1)!.data }).args?.[2]).toBe(zeroAddress);
+  });
+
+  it("authorizeSigner / revokeSigner check ownership and arguments before sending", async () => {
+    const wallet = (account: typeof seller) =>
+      createWalletClient({ account, transport: custom({ request: (a) => chain.request(a) }, { retryCount: 0 }) });
+    await expect(authorizeSigner({ walletClient: wallet(stranger), publicClient: chain.client, listingId, signer: delegate.address })).rejects.toMatchObject({
+      code: "not_listing_seller",
+    });
+    await expect(revokeSigner({ walletClient: wallet(seller), publicClient: chain.client, listingId, signer: seller.address })).rejects.toMatchObject({
+      code: "invalid_argument",
+    });
+    await expect(authorizeSigner({ walletClient: wallet(seller), publicClient: chain.client, listingId, signer: zeroAddress })).rejects.toMatchObject({
+      code: "invalid_argument",
+    });
+    await expect(authorizeSigner({ walletClient: wallet(seller), publicClient: chain.client, listingId: 99n, signer: delegate.address })).rejects.toMatchObject({
+      code: "listing_not_found",
+    });
+  });
+
+  it("integrator fees are rejected: any non-zero fee field reads tampered", async () => {
+    for (const quote of [
+      { ...created.quote, integratorFeeAmount: 1n },
+      { ...created.quote, integratorFeeRecipient: payer },
+    ]) {
+      expect((await readRequest(await resign({ ...created, quote }), { publicClient: chain.client })).status).toBe("tampered");
+    }
   });
 });
 

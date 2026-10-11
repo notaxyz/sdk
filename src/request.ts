@@ -67,7 +67,9 @@ function toListingId(value: bigint | number | string): bigint {
 }
 
 /**
- * Sign an unbound payment request against the seller's listing and encode it as a link.
+ * Sign an unbound payment request against a listing and encode it as a link. The signing account
+ * must be the listing's seller or a quote signer the seller authorized for that listing; either
+ * way the seller is paid.
  * Nothing is sent on-chain. The quote is checked with `validateSignedReceiptPurchase` before the
  * link is returned, so a link this function returns was payable when it was made.
  */
@@ -97,15 +99,23 @@ export async function createRequest(params: CreateRequestParams): Promise<Create
   assertRawPurchaseRef(rawPurchaseRef);
 
   const account = params.account ?? requireAccount(params.walletClient as WalletClient);
-  const seller = account.address;
+  const signer = account.address;
 
   const deployment = await assertDeployment(publicClient);
   const listing = await readListing(publicClient, deployment, listingId);
   if (!listing) throw new NotaError("listing_not_found", `Listing ${listingId} does not exist on chain ${deployment.chainId}`);
   if (!listing.active) throw new NotaError("listing_inactive", `Listing ${listingId} is inactive`);
-  if (!sameAddress(listing.seller, seller)) {
-    throw new NotaError("not_listing_seller", `Listing ${listingId} belongs to ${listing.seller}, not the signing account ${seller}`);
+  const seller = listing.seller;
+  const signedBySeller = sameAddress(seller, signer);
+  if (!signedBySeller && !(await isAuthorizedSigner(publicClient, deployment, listingId, signer))) {
+    throw new NotaError(
+      "not_authorized_signer",
+      `${signer} is neither the seller of listing ${listingId} (${seller}) nor a quote signer the seller authorized for it`,
+      { listingId, signer, seller },
+    );
   }
+  // claimedSigner: zero means "the seller"; anything else is checked against the listing's signers.
+  const claimedSigner = signedBySeller ? zeroAddress : signer;
 
   // Chain time, not the local clock: the contract rejects issuedAt ahead of block.timestamp.
   const block = await publicClient.getBlock({ blockTag: "latest" });
@@ -154,7 +164,7 @@ export async function createRequest(params: CreateRequestParams): Promise<Create
   }
 
   try {
-    await validateOnChain(publicClient, deployment, quote, signature, zeroAddress);
+    await validateOnChain(publicClient, deployment, quote, signature, zeroAddress, claimedSigner);
   } catch (error) {
     throw new NotaError("unexpected_revert", `The signed request did not validate on-chain: ${revertName(error) ?? (error as Error).message}`, undefined, {
       cause: error,
@@ -164,6 +174,8 @@ export async function createRequest(params: CreateRequestParams): Promise<Create
   const request: PaymentRequest = {
     chainId: deployment.chainId,
     store: deployment.store,
+    seller,
+    signer,
     quote,
     signature: signature.toLowerCase() as Hex,
     metadata,
@@ -172,13 +184,34 @@ export async function createRequest(params: CreateRequestParams): Promise<Create
   return { ...request, fromBlock: block.number, url: encodeRequest(request, params.baseUrl ?? DEFAULT_BASE_URL), purchaseRef };
 }
 
-function validateOnChain(publicClient: PublicClient, deployment: NotaDeployment, quote: SignedReceiptQuote, signature: Hex, payer: Address) {
+function validateOnChain(
+  publicClient: PublicClient,
+  deployment: NotaDeployment,
+  quote: SignedReceiptQuote,
+  signature: Hex,
+  payer: Address,
+  claimedSigner: Address,
+) {
   return publicClient.readContract({
     address: deployment.store,
     abi: notaReceiptStoreAbi,
     functionName: "validateSignedReceiptPurchase",
-    args: [quote, signature, payer, zeroAddress],
+    args: [quote, signature, payer, claimedSigner],
   });
+}
+
+function isAuthorizedSigner(publicClient: PublicClient, deployment: NotaDeployment, listingId: bigint, signer: Address) {
+  return publicClient.readContract({
+    address: deployment.store,
+    abi: notaReceiptStoreAbi,
+    functionName: "isQuoteSignerAuthorized",
+    args: [listingId, signer],
+  });
+}
+
+/** The `claimedSigner` argument for a request: zero when the seller signed it. */
+export function claimedSignerOf(request: Pick<PaymentRequest, "seller" | "signer">): Address {
+  return sameAddress(request.signer, request.seller) ? zeroAddress : request.signer;
 }
 
 export interface ReadRequestOptions {
@@ -270,10 +303,17 @@ export async function readRequest(input: RequestInput, options: ReadRequestOptio
   const block = await publicClient.getBlock({ blockTag: "latest" });
   if (request.quote.expiresAt <= block.timestamp) return result("expired", `expired at ${request.quote.expiresAt}`);
 
+  // A quote signed by someone other than the seller needs that signer to be authorized for this
+  // listing right now: revoking a signer kills its outstanding unpaid requests.
+  const claimedSigner = claimedSignerOf(request);
+  if (claimedSigner !== zeroAddress && !(await isAuthorizedSigner(publicClient, deployment, request.quote.listingId, claimedSigner))) {
+    return result("invalid_signature", `${request.signer} is not an authorized quote signer for listing ${request.quote.listingId}`);
+  }
+
   // 6. The contract's own validation path, without moving funds.
   try {
-    const validation = await validateOnChain(publicClient, deployment, request.quote, request.signature, options.payer ?? zeroAddress);
-    if (!sameAddress(validation.verifiedSigner, listing.seller) || validation.grossAmount !== request.quote.amount) {
+    const validation = await validateOnChain(publicClient, deployment, request.quote, request.signature, options.payer ?? zeroAddress, claimedSigner);
+    if (!sameAddress(validation.verifiedSigner, request.signer) || validation.grossAmount !== request.quote.amount) {
       return result("invalid_signature", "on-chain validation returned an unexpected signer or amount");
     }
   } catch (error) {

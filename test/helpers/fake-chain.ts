@@ -70,6 +70,8 @@ export class FakeChain {
   /** Override what SIGNED_RECEIPT_QUOTE_TYPEHASH returns, to test the deployment check. */
   typehashOverride?: Hex;
   usdcBalances = new Map<string, bigint>();
+  /** Authorized quote signers per listing (lowercase addresses). */
+  quoteSigners = new Map<bigint, Set<string>>();
   /** Allowance of `owner` for the store, keyed by lowercase owner. */
   usdcAllowances = new Map<string, bigint>();
   private nextListingId = 1n;
@@ -86,6 +88,19 @@ export class FakeChain {
     const id = this.nextListingId++;
     this.listings.set(id, { seller, listingHash, active, mode: 1 });
     return id;
+  }
+
+  authorizeSigner(listingId: bigint, signer: Address, authorized = true): void {
+    const set = this.quoteSigners.get(listingId) ?? new Set<string>();
+    if (authorized) set.add(signer.toLowerCase());
+    else set.delete(signer.toLowerCase());
+    this.quoteSigners.set(listingId, set);
+  }
+
+  private isSigner(listingId: bigint, signer: Address): boolean {
+    const listing = this.listings.get(listingId);
+    if (!listing) return false;
+    return signer.toLowerCase() === listing.seller.toLowerCase() || (this.quoteSigners.get(listingId)?.has(signer.toLowerCase()) ?? false);
   }
 
   mine(blocks = 1n, seconds = 2n * blocks): void {
@@ -244,8 +259,13 @@ export class FakeChain {
         if (!listing) revert("ListingNotFound");
         return encode({ ...listing, unitPrice: 0n });
       }
+      case "isQuoteSignerAuthorized": {
+        const [listingId, signer] = args as unknown as [bigint, Address];
+        if (!this.listings.has(listingId)) revert("ListingNotFound");
+        return encode(this.isSigner(listingId, signer));
+      }
       case "validateSignedReceiptPurchase": {
-        const [quote, signature, expectedBuyer] = args as unknown as [SignedReceiptQuote, Hex, Address, Address];
+        const [quote, signature, expectedBuyer, claimedSigner] = args as unknown as [SignedReceiptQuote, Hex, Address, Address];
         this.beforeValidate?.(quote);
         const listing = this.listings.get(quote.listingId);
         if (!listing) revert("ListingNotFound");
@@ -260,6 +280,8 @@ export class FakeChain {
         if (quote.expiresAt <= this.timestamp) revert("QuoteExpired");
         if (quote.expiresAt - quote.issuedAt > 86_400n) revert("QuoteExpiryTooLong");
         if (this.consumed.has(quote.purchaseRef.toLowerCase())) revert("PurchaseRefAlreadyUsed");
+        const claimed = claimedSigner === zeroAddress ? listing.seller : claimedSigner;
+        if (!this.isSigner(quote.listingId, claimed)) revert("InvalidQuoteSigner");
         let signer: Address;
         try {
           signer = await recoverTypedDataAddress({
@@ -275,7 +297,7 @@ export class FakeChain {
         } catch {
           revert("InvalidQuoteSigner");
         }
-        if (signer.toLowerCase() !== listing.seller.toLowerCase()) revert("InvalidQuoteSigner");
+        if (signer.toLowerCase() !== claimed.toLowerCase()) revert("InvalidQuoteSigner");
         return encode({
           grossAmount: quote.amount,
           protocolFee: 0n,

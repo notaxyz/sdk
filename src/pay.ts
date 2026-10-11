@@ -1,11 +1,11 @@
-import { encodeFunctionData, parseEventLogs, zeroAddress, type Address, type Hex, type PublicClient, type WalletClient } from "viem";
+import { encodeFunctionData, parseEventLogs, type Address, type Hex, type PublicClient, type WalletClient } from "viem";
 
 import { erc20Abi, notaReceiptStoreAbi } from "./abi.js";
 import { assertDeployment } from "./deployment.js";
 import { NotaError } from "./errors.js";
 import { assertWalletChain, requireAccount, sameAddress } from "./chain.js";
 import { matchesRequest, receiptFromLog, type RequestInput } from "./receipt.js";
-import { readRequest } from "./request.js";
+import { claimedSignerOf, readRequest } from "./request.js";
 import type { NotaReceipt, PaymentRequest } from "./types.js";
 
 export interface PayCall {
@@ -24,7 +24,8 @@ export interface PreparePayCallsParams {
 export interface PreparedPayCalls {
   /**
    * In order: USDC `approve(store, amount)` for exactly the quoted amount, present only when the
-   * payer's allowance is short, then `purchaseSignedReceipt(quote, signature, address(0))`.
+   * payer's allowance is short, then `purchaseSignedReceipt(quote, signature, claimedSigner)`,
+   * where claimedSigner is the zero address when the seller signed and the signer otherwise.
    * Both send zero value. A smart account can batch them into one operation.
    */
   calls: PayCall[];
@@ -71,7 +72,11 @@ async function preparePayment(params: PreparePayCallsParams): Promise<PreparedPa
   }
   calls.push({
     to: deployment.store,
-    data: encodeFunctionData({ abi: notaReceiptStoreAbi, functionName: "purchaseSignedReceipt", args: [quote, request.signature, zeroAddress] }),
+    data: encodeFunctionData({
+      abi: notaReceiptStoreAbi,
+      functionName: "purchaseSignedReceipt",
+      args: [quote, request.signature, claimedSignerOf(request)],
+    }),
   });
   return { calls, needsApproval, request };
 }
