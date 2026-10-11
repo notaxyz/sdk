@@ -90,6 +90,41 @@ await walletClient.sendCalls({ account: smartAccount, calls }); // EIP-5792, e.g
 
 `payRequest` uses `preparePayCalls` internally and sends the calls one at a time.
 
+## MCP server for AI clients
+
+[`examples/mcp-server.ts`](examples/mcp-server.ts) is a local stdio MCP server, so an MCP-capable desktop client can ask its user for USDC and gate paid work on a verified receipt. Requests are kept in memory.
+
+It provides three tools:
+
+| tool | does |
+| --- | --- |
+| `request_payment(amount, purpose)` | returns a link, its expiry and a request id |
+| `check_payment(request_id)` | returns `paid` (with the receipt and an explorer link), `pending`, `expired` or `blocked` |
+| `premium_fortune(request_id, topic)` | demo paid action: refuses until `check_payment` would say `paid` for a request whose purpose is `premium fortune`, at the demo price or more, and runs once per receipt |
+
+It reads `SIGNER_PRIVATE_KEY` (the seller or an authorized signer; never printed), `LISTING_ID`, `RPC_URL` (the chain is taken from it) and `PAY_BASE_URL`. To add it to a desktop client, for example in `claude_desktop_config.json`, use absolute paths:
+
+```json
+{
+  "mcpServers": {
+    "nota-payments": {
+      "command": "/ABSOLUTE/PATH/sdk/node_modules/.bin/tsx",
+      "args": ["/ABSOLUTE/PATH/sdk/examples/mcp-server.ts"],
+      "env": {
+        "SIGNER_PRIVATE_KEY": "0x...",
+        "LISTING_ID": "1",
+        "RPC_URL": "https://...",
+        "PAY_BASE_URL": "https://usenota.xyz/pay"
+      }
+    }
+  }
+}
+```
+
+Run `npm ci` in the repo first. A server-side signer key fits this setup well; see [cold seller, server-side signer](#recommended-cold-seller-server-side-signer).
+
+`check_payment` can also return `invalid`, with a reason, for a request that can no longer be paid for another reason: its listing was deactivated, or its signer was revoked.
+
 ## Link format
 
 ```
@@ -111,6 +146,7 @@ The payload sits in the URL fragment, which browsers never send to a server. The
   },
   "signature": "0x…",
   "metadata": { "schema": "nota.checkout.metadata.v1", "…": "…" },
+  "signer": "0x…",
   "fromBlock": "513536720"
 }
 ```
@@ -118,8 +154,9 @@ The payload sits in the URL fragment, which browsers never send to a server. The
 The format follows these rules:
 
 - **Numbers:** bigint values are decimal strings, and unknown versions and unknown fields are rejected.
-- **Quote:** `quote` is the contract's `SignedReceiptQuote`. It is unbound (`buyer` = zero address, so anyone may pay) and carries no integrator fee. It's signed with EIP-712 by the seller over the contract's `SIGNED_RECEIPT_QUOTE_TYPEHASH`, under the domain `NotaReceiptStore` / `2`.
+- **Quote:** `quote` is the contract's `SignedReceiptQuote`. It is unbound (`buyer` = zero address, so anyone may pay) and carries no integrator fee. It's signed with EIP-712 over the contract's `SIGNED_RECEIPT_QUOTE_TYPEHASH`, under the domain `NotaReceiptStore` / `2`. The signer is the seller or a signer the seller authorized, and the struct always names the listing's seller.
 - **Metadata:** `metadata` is the [`nota.checkout.metadata.v1`](https://github.com/notaxyz/contracts#canonical-checkout-metadata) document. The purpose is in `checkout.title` (truncated to 120 characters) and `checkout.description`. `quote.metadataHash` is the keccak256 of its JCS canonical form, so the text the payer sees is the text the seller signed.
+- **signer:** `signer` is present only when an authorized signer, not the seller, signed the quote, and is passed to the contract as `claimedSigner`. It isn't covered by the signature, but a wrong value only makes the signature check fail (`invalid_signature`).
 - **fromBlock:** `fromBlock` is an **unsigned** hint telling readers where to start the receipt log search.
 - **Size:** a typical link is about 2 KB.
 
@@ -133,8 +170,8 @@ The format follows these rules:
 | --- | --- |
 | `unknown_store` | The link names a contract that isn't the known Nota store for its chain. A link never chooses the contract. |
 | `wrong_chain` | The link is for a different chain than `publicClient`. |
-| `tampered` | The metadata doesn't hash to `quote.metadataHash`, or it disagrees with the quote, chain, store, token or on-chain listing. This also covers a quote that is buyer-bound or carries an integrator fee. |
-| `invalid_signature` | The quote isn't signed by the listing's seller, or the listing belongs to someone other than the seller named in the metadata. |
+| `tampered` | The metadata doesn't hash to `quote.metadataHash`, or it disagrees with the quote, chain, store, token or on-chain listing. This also covers a quote that is buyer-bound or has any non-zero integrator fee field (integrator fees aren't supported in this version). |
+| `invalid_signature` | The listing belongs to someone other than the seller named in the metadata, or the signer isn't authorized for the listing (never authorized, or since revoked), or the signature doesn't verify against the claimed signer. |
 | `paid` | A `ReceiptPurchasedV2` log from the known store matches this request's purchaseRef, seller, listingId, amount, metadataHash and agentId. The receipt is returned with this status. |
 | `blocked` | The reference was consumed on-chain, but no matching receipt was found. The request was **not** paid and can never be paid. |
 | `listing_inactive` | The listing doesn't exist or has been deactivated. |
@@ -157,11 +194,34 @@ Arbitrum Sepolia is a testnet for trying the flow end to end with test USDC. Its
 Before first use with a client, the SDK checks the store against this table and refuses to proceed if anything differs. It reads:
 - `SETTLEMENT_TOKEN` and `PURCHASE_REF_REGISTRY`
 - the EIP-712 name and version
-- `SIGNED_RECEIPT_QUOTE_TYPEHASH` The table is exported as `NOTA_DEPLOYMENTS`, and the ABIs are exported too.
+- `SIGNED_RECEIPT_QUOTE_TYPEHASH`
+
+The table is exported as `NOTA_DEPLOYMENTS`, and the ABIs are exported too.
 
 ## Warning: the issuing wallet is a hot wallet
 
-The key that signs requests sits in your agent's process or environment, and anyone who gets it can issue requests in your name. Payments go directly to that wallet's address. Keep only a little in it: enough ETH for gas, and sweep USDC out regularly.
+The key that signs requests sits in your agent's process or environment, and anyone who gets it can issue requests in your name. If that key is also the seller, payments go directly to it. Keep only a little in it: enough ETH for gas, and sweep USDC out regularly. Better still, use the setup below.
+
+### Recommended: cold seller, server-side signer
+
+The seller (who gets paid) and the signer (who signs requests) can be different keys:
+
+```ts
+import { authorizeSigner, revokeSigner } from "@notaxyz/sdk";
+
+// Once, from the cold seller wallet (e.g. a hardware wallet):
+await authorizeSigner({ walletClient: coldSellerWallet, publicClient, listingId, signer: serverSigner.address });
+
+// On the server or agent, only the signer key is present:
+const request = await createRequest({ account: serverSigner, publicClient, listingId, amount, purpose });
+// Payments still go to the cold seller address.
+```
+
+The roles split like this:
+- **Seller:** keep it cold. It's needed only for `setup`, `authorizeSigner` and `revokeSigner`, and it receives every payment.
+- **Signer:** a hot key that holds no funds and needs no gas. If it leaks, an attacker can issue requests in your name, but every payment still lands with the seller.
+- **Revoking:** `revokeSigner` cuts a leaked signer off. Its unpaid requests immediately read `invalid_signature`, while requests already paid stay `paid`.
+- **Limit:** the contract allows up to 3 authorized signers per listing.
 
 ## Limits
 
@@ -190,7 +250,8 @@ The `fromBlock` hint in the link isn't signed. If the hint is missing or wrong, 
 | --- | --- |
 | `setup({ walletClient, publicClient, listing })` | `{ listingId, txHash, listingHash }` |
 | `prepareSetup({ publicClient, listing })` | the unsent `createListing` transaction |
-| `createRequest({ walletClient \| account, publicClient, listingId, amount, purpose, expiresInSeconds?, agentId?, baseUrl? })` | `{ url, purchaseRef, quote, signature, metadata, fromBlock, chainId, store }` |
+| `createRequest({ walletClient \| account, publicClient, listingId, amount, purpose, expiresInSeconds?, agentId?, baseUrl? })`: the account is the seller or an authorized signer | `{ url, purchaseRef, seller, signer, quote, signature, metadata, fromBlock, chainId, store }` |
+| `authorizeSigner({ walletClient, publicClient, listingId, signer })` / `revokeSigner(...)`, sent by the seller | `{ txHash }` |
 | `readRequest(urlOrPayload, { publicClient, payer?, fromBlock? })` | `{ status, request, receipt?, reason? }` |
 | `payRequest({ walletClient, publicClient, request })` | `{ approveTxHash?, payTxHash, receipt }` |
 | `preparePayCalls({ publicClient, request, payer })` | `{ calls: [{ to, data }], needsApproval }` |
