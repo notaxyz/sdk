@@ -19,6 +19,7 @@ import {
   toLinkPayload,
   waitForReceipt,
   type CreateRequestResult,
+  type PayStep,
   type PaymentRequest,
 } from "../src/index.js";
 import { hashCheckoutMetadata } from "../src/metadata.js";
@@ -490,6 +491,90 @@ describe("preparePayCalls", () => {
     await expect(preparePayCalls({ publicClient: chain.client, request: tampered, payer })).rejects.toMatchObject({
       details: { status: "tampered" },
     });
+  });
+});
+
+describe("payRequest onStep", () => {
+  const wallet = () => createWalletClient({ account: payer, transport: custom({ request: (a) => chain.request(a) }, { retryCount: 0 }) });
+  const fund = (allowance = 0n) => {
+    chain.usdcBalances.set(payer.toLowerCase(), 1_000_000n);
+    chain.usdcAllowances.set(payer.toLowerCase(), allowance);
+  };
+
+  it("reports approve then pay, each awaiting_signature -> submitted -> confirmed, with tx hashes", async () => {
+    fund();
+    const steps: PayStep[] = [];
+    const result = await payRequest({ walletClient: wallet(), publicClient: chain.client, request: created.url, onStep: (s) => steps.push(s) });
+    expect(steps).toEqual([
+      { step: "approve", state: "awaiting_signature" },
+      { step: "approve", state: "submitted", txHash: result.approveTxHash },
+      { step: "approve", state: "confirmed", txHash: result.approveTxHash },
+      { step: "pay", state: "awaiting_signature" },
+      { step: "pay", state: "submitted", txHash: result.payTxHash },
+      { step: "pay", state: "confirmed", txHash: result.payTxHash },
+    ]);
+    expect(result.approveTxHash).not.toBe(result.payTxHash);
+    expect(result.receipt.payer).toBe(payer);
+    expect(chain.usdcBalances.get(seller.address.toLowerCase())).toBe(100_000n);
+    expect(chain.usdcAllowances.get(payer.toLowerCase())).toBe(0n);
+    expect((await readRequest(created.url, { publicClient: chain.client })).status).toBe("paid");
+  });
+
+  it("reports approve as skipped when the allowance already covers the amount", async () => {
+    fund(100_000n);
+    const steps: PayStep[] = [];
+    const result = await payRequest({ walletClient: wallet(), publicClient: chain.client, request: created.url, onStep: (s) => steps.push(s) });
+    expect(result.approveTxHash).toBeUndefined();
+    expect(steps).toEqual([
+      { step: "approve", state: "skipped" },
+      { step: "pay", state: "awaiting_signature" },
+      { step: "pay", state: "submitted", txHash: result.payTxHash },
+      { step: "pay", state: "confirmed", txHash: result.payTxHash },
+    ]);
+  });
+
+  it("reports nothing for a request refused before any transaction", async () => {
+    fund();
+    chain.consumed.add(created.quote.purchaseRef);
+    const steps: PayStep[] = [];
+    await expect(payRequest({ walletClient: wallet(), publicClient: chain.client, request: created.url, onStep: (s) => steps.push(s) })).rejects.toMatchObject({
+      code: "not_payable",
+    });
+    expect(steps).toEqual([]);
+  });
+
+  it("stops at awaiting_signature when the user rejects in the wallet", async () => {
+    fund(100_000n);
+    chain.rejectNextSend = true;
+    const steps: PayStep[] = [];
+    await expect(payRequest({ walletClient: wallet(), publicClient: chain.client, request: created.url, onStep: (s) => steps.push(s) })).rejects.toThrow(/rejected/i);
+    expect(steps).toEqual([
+      { step: "approve", state: "skipped" },
+      { step: "pay", state: "awaiting_signature" },
+    ]);
+    expect((await readRequest(created.url, { publicClient: chain.client })).status).toBe("payable");
+  });
+
+  it("a throwing callback cannot interrupt the payment", async () => {
+    fund();
+    let calls = 0;
+    const result = await payRequest({
+      walletClient: wallet(),
+      publicClient: chain.client,
+      request: created.url,
+      onStep: () => {
+        calls++;
+        throw new Error("UI bug");
+      },
+    });
+    expect(calls).toBe(6);
+    expect(result.receipt.amount).toBe(100_000n);
+  });
+
+  it("works without a callback", async () => {
+    fund();
+    const result = await payRequest({ walletClient: wallet(), publicClient: chain.client, request: created.url });
+    expect(result.approveTxHash).toBeDefined();
   });
 });
 

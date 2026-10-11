@@ -180,9 +180,15 @@ export class FakeChain {
         return this.block(number);
       }
       case "eth_call": {
-        const { to, data } = p[0] as { to: Address; data: Hex };
-        return this.call(to, data);
+        const { to, data, from } = p[0] as { to: Address; data: Hex; from?: Address };
+        return this.call(to, data, from);
       }
+      case "eth_sendTransaction":
+        return this.sendTransaction(p[0] as { from: Address; to: Address; data: Hex });
+      case "eth_getTransactionReceipt":
+        return this.transactionReceipt(p[0] as Hex);
+      case "eth_getTransactionByHash":
+        return null;
       case "eth_getLogs":
         return this.getLogs(p[0] as { address?: string; topics?: (Hex | Hex[] | null)[]; fromBlock?: Hex; toBlock?: Hex });
       default:
@@ -217,7 +223,130 @@ export class FakeChain {
       }));
   }
 
-  private async call(to: Address, data: Hex): Promise<Hex> {
+  /** Mirrors NotaReceiptStore._verifySignedReceiptQuoteWithSigner. */
+  private async verifyQuote(quote: SignedReceiptQuote, signature: Hex, expectedBuyer: Address, claimedSigner: Address) {
+    const listing = this.listings.get(quote.listingId);
+    if (!listing) revert("ListingNotFound");
+    if (!listing.active) revert("ListingInactive");
+    if (quote.buyer !== zeroAddress && quote.buyer.toLowerCase() !== expectedBuyer.toLowerCase()) revert("QuoteBuyerMismatch");
+    if (quote.purchaseRef === zeroHash) revert("InvalidPurchaseRef");
+    if (quote.metadataHash === zeroHash) revert("InvalidParams");
+    if (quote.amount < 100n) revert("AmountOutOfBounds");
+    if (quote.integratorFeeAmount !== 0n || quote.integratorFeeRecipient !== zeroAddress) revert("InvalidParams");
+    if (quote.issuedAt > this.timestamp) revert("InvalidParams");
+    if (quote.expiresAt <= quote.issuedAt) revert("InvalidParams");
+    if (quote.expiresAt <= this.timestamp) revert("QuoteExpired");
+    if (quote.expiresAt - quote.issuedAt > 86_400n) revert("QuoteExpiryTooLong");
+    if (this.consumed.has(quote.purchaseRef.toLowerCase())) revert("PurchaseRefAlreadyUsed");
+    const claimed = claimedSigner === zeroAddress ? listing.seller : claimedSigner;
+    if (!this.isSigner(quote.listingId, claimed)) revert("InvalidQuoteSigner");
+    let signer: Address;
+    try {
+      signer = await recoverTypedDataAddress({
+        ...signedQuoteTypedData(quote, {
+          chainId: this.chainId,
+          store: this.deployment.store,
+          settlementToken: this.deployment.usdc,
+          purchaseRefRegistry: this.deployment.registry,
+          seller: listing.seller,
+        }),
+        signature,
+      });
+    } catch {
+      revert("InvalidQuoteSigner");
+    }
+    if (signer.toLowerCase() !== claimed.toLowerCase()) revert("InvalidQuoteSigner");
+    return { listing, signer };
+  }
+
+  private async checkPurchase(from: Address, quote: SignedReceiptQuote, signature: Hex, claimedSigner: Address) {
+    const verified = await this.verifyQuote(quote, signature, from, claimedSigner);
+    const payer = from.toLowerCase();
+    // Mirrors SafeERC20.safeTransferFrom failing on allowance or balance.
+    if ((this.usdcAllowances.get(payer) ?? 0n) < quote.amount || (this.usdcBalances.get(payer) ?? 0n) < quote.amount) throw new RpcRevert("0x");
+    return verified;
+  }
+
+  /** Transactions sent through eth_sendTransaction, by hash. */
+  sentTransactions = new Map<Hex, { from: Address; to: Address; blockNumber: bigint; logs: FakeLog[] }>();
+  /** When set, the next eth_sendTransaction fails as if the user rejected it in their wallet. */
+  rejectNextSend = false;
+
+  private async sendTransaction(tx: { from: Address; to: Address; data: Hex }): Promise<Hex> {
+    if (this.rejectNextSend) {
+      this.rejectNextSend = false;
+      throw Object.assign(new Error("User rejected the request."), { code: 4001 });
+    }
+    const from = tx.from;
+    const target = tx.to.toLowerCase();
+    let logs: FakeLog[] = [];
+    if (target === this.deployment.usdc.toLowerCase()) {
+      const { functionName, args } = decodeFunctionData({ abi: erc20Abi, data: tx.data });
+      if (functionName !== "approve") throw new Error(`FakeChain: usdc.${functionName} tx not modelled`);
+      if ((args[0] as Address).toLowerCase() === this.deployment.store.toLowerCase()) this.usdcAllowances.set(from.toLowerCase(), args[1] as bigint);
+      this.mine();
+    } else if (target === this.deployment.store.toLowerCase()) {
+      const { functionName, args } = decodeFunctionData({ abi: notaReceiptStoreAbi, data: tx.data });
+      if (functionName !== "purchaseSignedReceipt") throw new Error(`FakeChain: store.${functionName} tx not modelled`);
+      const [quote, signature, claimedSigner] = args as unknown as [SignedReceiptQuote, Hex, Address];
+      const { listing } = await this.checkPurchase(from, quote, signature, claimedSigner);
+      const payer = from.toLowerCase();
+      this.usdcAllowances.set(payer, (this.usdcAllowances.get(payer) ?? 0n) - quote.amount);
+      this.usdcBalances.set(payer, (this.usdcBalances.get(payer) ?? 0n) - quote.amount);
+      const seller = listing.seller.toLowerCase();
+      this.usdcBalances.set(seller, (this.usdcBalances.get(seller) ?? 0n) + quote.amount);
+      logs = [
+        this.emitReceipt({
+          seller: listing.seller,
+          buyer: from,
+          listingId: quote.listingId,
+          purchaseRef: quote.purchaseRef,
+          amount: quote.amount,
+          metadataHash: quote.metadataHash,
+          agentId: quote.agentId,
+        }),
+      ];
+    } else {
+      throw new Error(`FakeChain: transaction to ${tx.to} not modelled`);
+    }
+    const hash = logs[0]?.transactionHash ?? (`0x${this.blockNumber.toString(16).padStart(64, "0")}` as Hex);
+    this.sentTransactions.set(hash, { from, to: tx.to, blockNumber: this.blockNumber, logs });
+    return hash;
+  }
+
+  private transactionReceipt(hash: Hex) {
+    const tx = this.sentTransactions.get(hash);
+    if (!tx) return null;
+    const blockHash = `0x${tx.blockNumber.toString(16).padStart(64, "0")}`;
+    return {
+      transactionHash: hash,
+      transactionIndex: "0x0",
+      blockHash,
+      blockNumber: numberToHex(tx.blockNumber),
+      from: tx.from,
+      to: tx.to,
+      cumulativeGasUsed: "0x5208",
+      gasUsed: "0x5208",
+      effectiveGasPrice: "0x1",
+      contractAddress: null,
+      logsBloom: `0x${"00".repeat(256)}`,
+      status: "0x1",
+      type: "0x2",
+      logs: tx.logs.map((log) => ({
+        address: log.address,
+        topics: log.topics,
+        data: log.data,
+        blockNumber: numberToHex(log.blockNumber),
+        blockHash,
+        transactionHash: log.transactionHash,
+        transactionIndex: "0x0",
+        logIndex: numberToHex(log.logIndex),
+        removed: false,
+      })),
+    };
+  }
+
+  private async call(to: Address, data: Hex, from: Address = zeroAddress): Promise<Hex> {
     const target = to.toLowerCase();
     if (target === this.deployment.registry.toLowerCase()) {
       const { functionName, args } = decodeFunctionData({ abi: purchaseRefRegistryAbi, data });
@@ -235,6 +364,7 @@ export class FakeChain {
         const result = spender === this.deployment.store.toLowerCase() ? (this.usdcAllowances.get(owner) ?? 0n) : 0n;
         return encodeFunctionResult({ abi: erc20Abi, functionName, result });
       }
+      if (functionName === "approve") return encodeFunctionResult({ abi: erc20Abi, functionName, result: true });
       throw new Error(`FakeChain: usdc.${functionName} not modelled`);
     }
     if (target !== this.deployment.store.toLowerCase()) throw new RpcRevert("0x");
@@ -267,37 +397,7 @@ export class FakeChain {
       case "validateSignedReceiptPurchase": {
         const [quote, signature, expectedBuyer, claimedSigner] = args as unknown as [SignedReceiptQuote, Hex, Address, Address];
         this.beforeValidate?.(quote);
-        const listing = this.listings.get(quote.listingId);
-        if (!listing) revert("ListingNotFound");
-        if (!listing.active) revert("ListingInactive");
-        if (quote.buyer !== zeroAddress && quote.buyer.toLowerCase() !== expectedBuyer.toLowerCase()) revert("QuoteBuyerMismatch");
-        if (quote.purchaseRef === zeroHash) revert("InvalidPurchaseRef");
-        if (quote.metadataHash === zeroHash) revert("InvalidParams");
-        if (quote.amount < 100n) revert("AmountOutOfBounds");
-        if (quote.integratorFeeAmount !== 0n || quote.integratorFeeRecipient !== zeroAddress) revert("InvalidParams");
-        if (quote.issuedAt > this.timestamp) revert("InvalidParams");
-        if (quote.expiresAt <= quote.issuedAt) revert("InvalidParams");
-        if (quote.expiresAt <= this.timestamp) revert("QuoteExpired");
-        if (quote.expiresAt - quote.issuedAt > 86_400n) revert("QuoteExpiryTooLong");
-        if (this.consumed.has(quote.purchaseRef.toLowerCase())) revert("PurchaseRefAlreadyUsed");
-        const claimed = claimedSigner === zeroAddress ? listing.seller : claimedSigner;
-        if (!this.isSigner(quote.listingId, claimed)) revert("InvalidQuoteSigner");
-        let signer: Address;
-        try {
-          signer = await recoverTypedDataAddress({
-            ...signedQuoteTypedData(quote, {
-              chainId: this.chainId,
-              store: this.deployment.store,
-              settlementToken: this.deployment.usdc,
-              purchaseRefRegistry: this.deployment.registry,
-              seller: listing.seller,
-            }),
-            signature,
-          });
-        } catch {
-          revert("InvalidQuoteSigner");
-        }
-        if (signer.toLowerCase() !== claimed.toLowerCase()) revert("InvalidQuoteSigner");
+        const { listing, signer } = await this.verifyQuote(quote, signature, expectedBuyer, claimedSigner);
         return encode({
           grossAmount: quote.amount,
           protocolFee: 0n,
@@ -309,6 +409,12 @@ export class FakeChain {
           listingHash: listing.listingHash,
           verifiedSigner: signer,
         });
+      }
+      case "purchaseSignedReceipt": {
+        // Simulation only: same checks the transaction would make, no state change.
+        const [quote, signature, claimedSigner] = args as unknown as [SignedReceiptQuote, Hex, Address];
+        await this.checkPurchase(from, quote, signature, claimedSigner);
+        return encode(this.nextReceiptId);
       }
       default:
         throw new Error(`FakeChain: store.${functionName} not modelled`);

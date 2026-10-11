@@ -91,6 +91,16 @@ export async function preparePayCalls(params: PreparePayCallsParams): Promise<Pr
   return { calls, needsApproval };
 }
 
+export type PayStepName = "approve" | "pay";
+export type PayStepState = "skipped" | "awaiting_signature" | "submitted" | "confirmed";
+
+export interface PayStep {
+  step: PayStepName;
+  state: PayStepState;
+  /** Present for "submitted" and "confirmed". */
+  txHash?: Hex;
+}
+
 export interface PayRequestParams {
   walletClient: WalletClient;
   publicClient: PublicClient;
@@ -98,6 +108,14 @@ export interface PayRequestParams {
   request: RequestInput;
   /** Confirmations to wait for on each transaction. Default 1. */
   confirmations?: number;
+  /**
+   * Progress callback, e.g. to tell the user which wallet prompt is coming. Called in order:
+   * approve (either "skipped", or "awaiting_signature" -> "submitted" -> "confirmed"), then pay
+   * ("awaiting_signature" -> "submitted" -> "confirmed"). Nothing is reported for a request
+   * that is refused before any transaction. The callback is not awaited, and an error it throws
+   * is ignored so it cannot interrupt a payment halfway.
+   */
+  onStep?: (step: PayStep) => void;
 }
 
 export interface PayRequestResult {
@@ -116,33 +134,51 @@ export async function payRequest(params: PayRequestParams): Promise<PayRequestRe
   const confirmations = params.confirmations ?? 1;
   const account = requireAccount(walletClient);
   const payer = account.address;
+  const report = (step: PayStep) => {
+    try {
+      params.onStep?.(step);
+    } catch {
+      // A UI callback must not abort a payment between its approve and purchase transactions.
+    }
+  };
 
   const { calls, needsApproval, request } = await preparePayment({ publicClient, request: params.request, payer });
   const deployment = await assertDeployment(publicClient);
   await assertWalletChain(walletClient, deployment.chainId);
   const chain = walletClient.chain ?? null;
 
-  const hashes: Hex[] = [];
-  for (const call of calls) {
-    // Simulate each call right before sending it, so a revert surfaces before it costs gas.
+  const send = async (step: PayStepName, call: PayCall) => {
+    // Simulate right before sending, so a revert surfaces before it costs gas.
     await publicClient.call({ account, to: call.to, data: call.data });
-    const hash = await walletClient.sendTransaction({ account, chain, to: call.to, data: call.data });
-    const txReceipt = await publicClient.waitForTransactionReceipt({ hash, confirmations });
+    report({ step, state: "awaiting_signature" });
+    const txHash = await walletClient.sendTransaction({ account, chain, to: call.to, data: call.data });
+    report({ step, state: "submitted", txHash });
+    const txReceipt = await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations });
     if (txReceipt.status !== "success") {
-      throw new NotaError("transaction_failed", `Transaction ${hash} to ${call.to} reverted`, { txHash: hash });
+      throw new NotaError("transaction_failed", `${step} transaction ${txHash} to ${call.to} reverted`, { txHash, step });
     }
-    hashes.push(hash);
-    if (call === calls[calls.length - 1]) {
-      const logs = parseEventLogs({ abi: notaReceiptStoreAbi, eventName: "ReceiptPurchasedV2", logs: txReceipt.logs });
-      for (const log of logs) {
-        if (!sameAddress(log.address, deployment.store)) continue;
-        const receipt = receiptFromLog(log, deployment.chainId);
-        if (receipt && matchesRequest(receipt, request, request.metadata.seller) && sameAddress(receipt.payer, payer)) {
-          return { ...(needsApproval ? { approveTxHash: hashes[0] } : {}), payTxHash: hash, receipt };
-        }
-      }
-      throw new NotaError("receipt_mismatch", `Transaction ${hash} succeeded but emitted no matching ReceiptPurchasedV2`, { txHash: hash });
+    report({ step, state: "confirmed", txHash });
+    return { txHash, txReceipt };
+  };
+
+  const purchaseCall = calls[calls.length - 1];
+  if (!purchaseCall) throw new NotaError("transaction_failed", "No purchase call was prepared");
+
+  let approveTxHash: Hex | undefined;
+  if (needsApproval) {
+    approveTxHash = (await send("approve", calls[0]!)).txHash;
+  } else {
+    report({ step: "approve", state: "skipped" });
+  }
+
+  const { txHash: payTxHash, txReceipt } = await send("pay", purchaseCall);
+  const logs = parseEventLogs({ abi: notaReceiptStoreAbi, eventName: "ReceiptPurchasedV2", logs: txReceipt.logs });
+  for (const log of logs) {
+    if (!sameAddress(log.address, deployment.store)) continue;
+    const receipt = receiptFromLog(log, deployment.chainId);
+    if (receipt && matchesRequest(receipt, request, request.metadata.seller) && sameAddress(receipt.payer, payer)) {
+      return { ...(approveTxHash ? { approveTxHash } : {}), payTxHash, receipt };
     }
   }
-  throw new NotaError("transaction_failed", "No purchase call was prepared");
+  throw new NotaError("receipt_mismatch", `Transaction ${payTxHash} succeeded but emitted no matching ReceiptPurchasedV2`, { txHash: payTxHash });
 }

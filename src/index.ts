@@ -17,6 +17,9 @@ export {
   type PreparePayCallsParams,
   type PreparedPayCalls,
   type PayCall,
+  type PayStep,
+  type PayStepName,
+  type PayStepState,
 } from "./pay.js";
 export {
   getReceipt,

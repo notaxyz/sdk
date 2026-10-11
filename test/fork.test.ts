@@ -28,6 +28,7 @@ import {
   type CheckoutMetadata,
   type CreateRequestResult,
   type NotaDeployment,
+  type PayStep,
   type SignedReceiptQuote,
 } from "../src/index.js";
 import { startFork, dealErc20, type AnvilFork } from "./helpers/anvil.js";
@@ -126,7 +127,16 @@ for (const suite of suites) {
       expect((await readRequest(paid.url, { publicClient: fork.publicClient })).status).toBe("payable");
 
       const [sellerBefore, storeBefore, payerBefore] = await Promise.all([usdcBalance(sellerAccount.address), usdcBalance(deployment.store), usdcBalance(payer)]);
-      const result = await payRequest({ walletClient: payerWallet, publicClient: fork.publicClient, request: paid.url });
+      const steps: PayStep[] = [];
+      const result = await payRequest({ walletClient: payerWallet, publicClient: fork.publicClient, request: paid.url, onStep: (s) => steps.push(s) });
+      expect(steps).toEqual([
+        { step: "approve", state: "awaiting_signature" },
+        { step: "approve", state: "submitted", txHash: result.approveTxHash },
+        { step: "approve", state: "confirmed", txHash: result.approveTxHash },
+        { step: "pay", state: "awaiting_signature" },
+        { step: "pay", state: "submitted", txHash: result.payTxHash },
+        { step: "pay", state: "confirmed", txHash: result.payTxHash },
+      ]);
       const [sellerAfter, storeAfter, payerAfter] = await Promise.all([usdcBalance(sellerAccount.address), usdcBalance(deployment.store), usdcBalance(payer)]);
 
       expect(result.approveTxHash).toBeDefined();
@@ -161,8 +171,10 @@ for (const suite of suites) {
     it("skips the approval when the allowance already covers the amount", async () => {
       const r = await request({ amount: 250n });
       await payer2Wallet.writeContract({ chain: suite.chain, account: payer2, address: deployment.usdc, abi: erc20Abi, functionName: "approve", args: [deployment.store, 250n] });
-      const result = await payRequest({ walletClient: payer2Wallet, publicClient: fork.publicClient, request: r.url });
+      const steps: PayStep[] = [];
+      const result = await payRequest({ walletClient: payer2Wallet, publicClient: fork.publicClient, request: r.url, onStep: (s) => steps.push(s) });
       expect(result.approveTxHash).toBeUndefined();
+      expect(steps.map((s) => `${s.step}:${s.state}`)).toEqual(["approve:skipped", "pay:awaiting_signature", "pay:submitted", "pay:confirmed"]);
       expect(result.receipt.amount).toBe(250n);
     });
 

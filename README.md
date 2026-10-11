@@ -71,6 +71,19 @@ if (status === "payable") {
 
 `payRequest` runs `readRequest` first and refuses anything that isn't `"payable"`. It also checks the payer's USDC balance. When the payer's existing allowance is too low, it approves the store for **exactly** the quoted amount, never an unlimited amount. It then calls `purchaseSignedReceipt`, which moves the USDC from the payer through the store to the seller in the same transaction. It returns the verified receipt from that transaction's `ReceiptPurchasedV2` log.
 
+To show progress, for example "confirm the approval in your wallet", pass `onStep`:
+
+```ts
+await payRequest({ walletClient, publicClient, request: url, onStep: ({ step, state, txHash }) => console.log(step, state, txHash ?? "") });
+// approve awaiting_signature / approve submitted 0x… / approve confirmed 0x…   (or: approve skipped)
+// pay awaiting_signature / pay submitted 0x… / pay confirmed 0x…
+```
+
+The callback works like this:
+- **Steps:** `step` is `"approve"` or `"pay"`. `state` is `"skipped"` (approve only, when the allowance already covers the amount), `"awaiting_signature"`, `"submitted"` or `"confirmed"`. `txHash` is present once a transaction is submitted.
+- **Refusals:** if a request is refused before any transaction, nothing is reported.
+- **Errors:** the callback isn't awaited, and any error it throws is ignored, so a UI bug can't stop a payment between its two transactions.
+
 ### Smart accounts: one batched operation
 
 `preparePayCalls` performs the same checks as `payRequest` and returns the calls without sending anything:
@@ -253,7 +266,7 @@ The `fromBlock` hint in the link isn't signed. If the hint is missing or wrong, 
 | `createRequest({ walletClient \| account, publicClient, listingId, amount, purpose, expiresInSeconds?, agentId?, baseUrl? })`: the account is the seller or an authorized signer | `{ url, purchaseRef, seller, signer, quote, signature, metadata, fromBlock, chainId, store }` |
 | `authorizeSigner({ walletClient, publicClient, listingId, signer })` / `revokeSigner(...)`, sent by the seller | `{ txHash }` |
 | `readRequest(urlOrPayload, { publicClient, payer?, fromBlock? })` | `{ status, request, receipt?, reason? }` |
-| `payRequest({ walletClient, publicClient, request })` | `{ approveTxHash?, payTxHash, receipt }` |
+| `payRequest({ walletClient, publicClient, request, onStep? })` | `{ approveTxHash?, payTxHash, receipt }` |
 | `preparePayCalls({ publicClient, request, payer })` | `{ calls: [{ to, data }], needsApproval }` |
 | `waitForReceipt({ publicClient, request, fromBlock?, timeoutMs?, maxBlockRange? })` | `receipt` |
 | `getReceipt({ publicClient, request, fromBlock?, maxBlockRange? })` | `receipt \| null` |
