@@ -2,12 +2,22 @@
  * An agent that runs out of budget, asks for funding with a Nota payment link, and continues once
  * a verified on-chain receipt arrives.
  *
- *   export AGENT_PRIVATE_KEY=0x...   # issuing hot wallet: needs a little ETH for the one-time setup
+ *   export AGENT_PRIVATE_KEY=0x...   # the listing's seller, or a quote signer the seller authorized
  *   export RPC_URL=https://...       # or ARBITRUM_RPC_URL; the chain is taken from the RPC's chain id
- *   npx tsx examples/agent.ts                      # first run: prints the setup transaction, exits
- *   npx tsx examples/agent.ts --setup              # sends the one-time createListing transaction
- *   npx tsx examples/agent.ts --amount 0.10 --purpose "run 100 more searches"
- *   npx tsx examples/agent.ts --base-url http://localhost:3000/pay   # links for a local payment page
+ *
+ * Setup runs once per seller. After that, store the listing id and pass it on every run:
+ *   npx tsx examples/agent.ts --listing-id 7 --amount 0.10 --purpose "run 100 more searches"
+ *   LISTING_ID=7 npx tsx examples/agent.ts --amount 0.10 --purpose "run 100 more searches"
+ *
+ * The listing id is taken from --listing-id, then LISTING_ID, then .nota-agent.json (written only
+ * by --setup). With an explicit id the listing must exist, be active, and accept this wallet as its
+ * seller or an authorized signer; --setup is refused so no second listing is created.
+ *
+ * Only when no id is available at all:
+ *   npx tsx examples/agent.ts            # prints the one-time setup transaction (NOT sent) and exits
+ *   npx tsx examples/agent.ts --setup    # sends createListing (needs a little ETH), saves the id
+ *
+ *   npx tsx examples/agent.ts --listing-id 7 --base-url http://localhost:3000/pay   # local payment page
  *
  * Supported chains: Arbitrum One, Base, and the Arbitrum Sepolia testnet.
  * The private key is read from the environment and never printed or logged.
@@ -29,8 +39,10 @@ import {
   setup,
   waitForReceipt,
 } from "../src/index.js";
+import { ListingError, describeListing, resolveListingId, verifyListing } from "./listing.js";
 
-const STATE_FILE = new URL("../.nota-agent.json", import.meta.url);
+// NOTA_AGENT_STATE_FILE overrides where the id saved by --setup is kept (used by the tests).
+const STATE_FILE = process.env.NOTA_AGENT_STATE_FILE || new URL("../.nota-agent.json", import.meta.url);
 const LISTING = {
   schema: "nota.listing.metadata.v1",
   kind: "agent_request",
@@ -56,6 +68,7 @@ const { values: flags } = parseArgs({
     purpose: { type: "string", default: "continue the current task" },
     expires: { type: "string", default: "3600" },
     setup: { type: "boolean", default: false },
+    "listing-id": { type: "string" },
     "base-url": { type: "string" },
   },
 });
@@ -101,11 +114,28 @@ try {
 }
 const expiresInSeconds = Number(flags.expires);
 
-let listingId = loadListingId();
-if (listingId === undefined) {
+let resolved;
+try {
+  resolved = resolveListingId({ flag: flags["listing-id"], env: process.env.LISTING_ID, saved: loadListingId(), setup: flags.setup });
+} catch (error) {
+  if (error instanceof ListingError) fail(error.message);
+  throw error;
+}
+
+let listingId: bigint;
+if (resolved) {
+  listingId = resolved.listingId;
+  try {
+    const verified = await verifyListing({ publicClient, deployment, listingId: resolved.listingId, wallet: account.address });
+    console.log(describeListing(resolved, verified));
+  } catch (error) {
+    if (error instanceof ListingError) fail(error.message);
+    throw error;
+  }
+} else {
   const prepared = await prepareSetup({ publicClient, listing: LISTING });
   if (!flags.setup) {
-    console.log("No listing saved for this wallet yet. One-time setup transaction (NOT sent):");
+    console.log("No listing id given (--listing-id, LISTING_ID) or saved. One-time setup transaction (NOT sent):");
     console.log(`  chain:       ${deployment.name} (${prepared.chainId})`);
     console.log(`  from:        ${account.address}`);
     console.log(`  to:          ${prepared.to}  (NotaReceiptStore)`);
@@ -114,12 +144,14 @@ if (listingId === undefined) {
     console.log(`  data:        ${prepared.data}`);
     console.log(`  listing doc: ${prepared.canonicalListing}`);
     console.log("Run again with --setup to send it. The sending wallet becomes the seller and receives every payment.");
+    console.log("If a listing already exists, pass it instead: --listing-id <id> or LISTING_ID=<id>.");
     process.exit(1);
   }
   console.log(`Sending createListing from ${account.address} ...`);
   const result = await setup({ walletClient, publicClient, listing: LISTING });
   saveListingId(result.listingId);
   console.log(`Listing ${result.listingId} created: ${deployment.explorer}/tx/${result.txHash}`);
+  console.log(`Saved to .nota-agent.json. Store this id and pass --listing-id ${result.listingId} (or LISTING_ID) from now on.`);
   listingId = result.listingId;
 }
 

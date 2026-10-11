@@ -12,7 +12,7 @@ npm install @notaxyz/sdk viem
 
 ## For an agent: two calls
 
-One-time setup creates the issuer's listing. The issuing wallet becomes the seller and receives every payment, and setup costs one transaction of gas:
+Setup runs **once** per seller. It creates the listing, costs one transaction of gas, and makes the sending wallet the seller, who receives every payment:
 
 ```ts
 import { setup } from "@notaxyz/sdk";
@@ -22,7 +22,7 @@ const { listingId } = await setup({
   publicClient,
   listing: { schema: "nota.listing.metadata.v1", kind: "agent_request", title: "Agent budget top-up", currency: "USDC", decimals: 6 },
 });
-// Store listingId; reuse it for every request.
+// Store listingId (config, env var, database) and pass it on every later run. Don't call setup again.
 ```
 
 After that, each top-up takes two calls and no transactions from the issuer:
@@ -45,16 +45,18 @@ console.log(`Funded by ${receipt.payer}, receipt #${receipt.receiptId}, tx ${rec
 
 `waitForReceipt` resolves only on a verified matching receipt. It rejects with `NotaError` code `"purchase_ref_blocked"` if the request's reference was consumed without one (see [Known limitation](#known-limitation-blocked-requests)), and with `"timeout"` if nobody pays before expiry. `getReceipt` does the same check once and returns `null` while the request is unpaid.
 
-[`examples/agent.ts`](examples/agent.ts) is a complete runnable agent:
+[`examples/agent.ts`](examples/agent.ts) is a complete runnable agent. Once you have a listing, pass its id on every run:
 
 ```bash
-AGENT_PRIVATE_KEY=0x... RPC_URL=https://... npx tsx examples/agent.ts --amount 0.10 --purpose "run 100 more searches"
+AGENT_PRIVATE_KEY=0x... RPC_URL=https://... npx tsx examples/agent.ts --listing-id 7 --amount 0.10 --purpose "run 100 more searches"
 ```
 
 The example works like this:
 - **Chain:** it takes the chain from the RPC's chain id (Arbitrum One, Base or the Arbitrum Sepolia testnet).
 - **RPC variable:** it reads `RPC_URL`, or `ARBITRUM_RPC_URL` if `RPC_URL` isn't set.
-- **Setup:** on the first run it prints the setup transaction it would send and exits. Run it with `--setup` to send that transaction.
+- **Listing id:** it uses `--listing-id`, then the `LISTING_ID` env var, then the id saved in `.nota-agent.json` by an earlier `--setup`, and prints which listing it used and where the id came from.
+- **Listing check:** the listing must exist and be active, and the wallet must be its seller or a signer the seller authorized. When the wallet is a signer, the example also prints the seller's address, since that's who gets paid.
+- **Setup:** only when no id is available at all does it print the one-time setup transaction and exit. Run it with `--setup` to send that transaction and save the id. `--setup` together with `--listing-id` or `LISTING_ID` is refused, so a second listing is never created by accident.
 - **Local testing:** `--base-url http://localhost:3000/pay` makes the links point at a local payment page.
 
 ## For a payer
