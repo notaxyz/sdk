@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+*.tgz
+.env
+.env.*
+# Local listing id saved by examples/agent.ts
+.nota-agent.json
+.DS_Store

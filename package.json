@@ -1,0 +1,68 @@
+{
+  "name": "@notaxyz/sdk",
+  "version": "0.1.0",
+  "description": "Issue signed USDC payment requests as links, pay them, and read the on-chain Nota receipt. Client-side only.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/notaxyz/sdk.git"
+  },
+  "homepage": "https://github.com/notaxyz/sdk#readme",
+  "bugs": {
+    "url": "https://github.com/notaxyz/sdk/issues"
+  },
+  "keywords": [
+    "nota",
+    "usdc",
+    "payment-request",
+    "receipt",
+    "eip-712",
+    "agent",
+    "arbitrum",
+    "base",
+    "viem"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": {
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "@types/node": "^20.19.0",
+    "eslint": "^9.39.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.46.0",
+    "viem": "^2.57.4",
+    "vitest": "^3.2.0"
+  }
+}
