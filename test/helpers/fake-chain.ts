@@ -21,7 +21,7 @@ import {
 } from "viem";
 
 import { erc20Abi, notaReceiptStoreAbi, purchaseRefRegistryAbi } from "../../src/abi.js";
-import { NOTA_DEPLOYMENTS } from "../../src/addresses.js";
+import { NOTA_DEPLOYMENTS, SIGNED_RECEIPT_QUOTE_TYPEHASH } from "../../src/addresses.js";
 import { signedQuoteTypedData } from "../../src/typed-data.js";
 import type { SignedReceiptQuote } from "../../src/types.js";
 
@@ -67,11 +67,16 @@ export class FakeChain {
   beforeValidate?: (quote: SignedReceiptQuote) => void;
   /** Override what SETTLEMENT_TOKEN returns, to test the deployment check. */
   settlementTokenOverride?: Address;
+  /** Override what SIGNED_RECEIPT_QUOTE_TYPEHASH returns, to test the deployment check. */
+  typehashOverride?: Hex;
+  usdcBalances = new Map<string, bigint>();
+  /** Allowance of `owner` for the store, keyed by lowercase owner. */
+  usdcAllowances = new Map<string, bigint>();
   private nextListingId = 1n;
   private nextReceiptId = 1n;
   readonly client: PublicClient;
 
-  constructor(chainId: 42161 | 8453 = 42161) {
+  constructor(chainId: 42161 | 8453 | 421614 = 42161) {
     this.chainId = chainId;
     this.deployment = NOTA_DEPLOYMENTS[chainId] as (typeof NOTA_DEPLOYMENTS)[42161];
     this.client = createPublicClient({ transport: custom({ request: (args) => this.request(args) }, { retryCount: 0 }), pollingInterval: 10 }) as PublicClient;
@@ -207,8 +212,14 @@ export class FakeChain {
       throw new Error(`FakeChain: registry.${functionName} not modelled`);
     }
     if (target === this.deployment.usdc.toLowerCase()) {
-      const { functionName } = decodeFunctionData({ abi: erc20Abi, data });
-      if (functionName === "balanceOf" || functionName === "allowance") return encodeFunctionResult({ abi: erc20Abi, functionName, result: 0n });
+      const { functionName, args } = decodeFunctionData({ abi: erc20Abi, data });
+      const owner = String(args?.[0]).toLowerCase();
+      if (functionName === "balanceOf") return encodeFunctionResult({ abi: erc20Abi, functionName, result: this.usdcBalances.get(owner) ?? 0n });
+      if (functionName === "allowance") {
+        const spender = String(args?.[1]).toLowerCase();
+        const result = spender === this.deployment.store.toLowerCase() ? (this.usdcAllowances.get(owner) ?? 0n) : 0n;
+        return encodeFunctionResult({ abi: erc20Abi, functionName, result });
+      }
       throw new Error(`FakeChain: usdc.${functionName} not modelled`);
     }
     if (target !== this.deployment.store.toLowerCase()) throw new RpcRevert("0x");
@@ -224,6 +235,8 @@ export class FakeChain {
         return encode("NotaReceiptStore");
       case "EIP712_VERSION":
         return encode("2");
+      case "SIGNED_RECEIPT_QUOTE_TYPEHASH":
+        return encode(this.typehashOverride ?? SIGNED_RECEIPT_QUOTE_TYPEHASH);
       case "purchasesPaused":
         return encode(false);
       case "getListing": {

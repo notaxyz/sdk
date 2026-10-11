@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
 
-import { recoverTypedDataAddress, type Hex } from "viem";
+import { keccak256, recoverTypedDataAddress, stringToBytes, type Hex } from "viem";
 import { describe, expect, it } from "vitest";
 
 import {
   NOTA_DEPLOYMENTS,
+  SIGNED_RECEIPT_QUOTE_TYPEHASH,
+  SIGNED_RECEIPT_QUOTE_TYPES,
   canonicalize,
   hashCheckoutMetadata,
   hashPurchaseRef,
@@ -47,6 +49,11 @@ const context = {
 } as const;
 
 describe("offline vectors from Arbitrum One receipt #1", () => {
+  it("SIGNED_RECEIPT_QUOTE_TYPEHASH matches the typed-data definition", () => {
+    const fields = SIGNED_RECEIPT_QUOTE_TYPES.SignedReceiptQuote.map((f) => `${f.type} ${f.name}`).join(",");
+    expect(keccak256(stringToBytes(`SignedReceiptQuote(${fields})`))).toBe(SIGNED_RECEIPT_QUOTE_TYPEHASH);
+  });
+
   it("EIP-712 digest matches the broadcast purchase", () => {
     expect(quoteDigest(realQuote, context)).toBe("0x5d199c8b0a1d37b0b3345502c75f8c43c1def9a6d79fe96a702afc6b7a0f7d9e");
   });

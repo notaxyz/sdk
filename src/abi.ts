@@ -19,6 +19,7 @@ export const notaReceiptStoreAbi = parseAbi([
   "function PURCHASE_REF_REGISTRY() view returns (address)",
   "function EIP712_NAME() view returns (string)",
   "function EIP712_VERSION() view returns (string)",
+  "function SIGNED_RECEIPT_QUOTE_TYPEHASH() view returns (bytes32)",
   "function purchasesPaused() view returns (bool)",
   "function listingCreationPaused() view returns (bool)",
 
