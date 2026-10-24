@@ -1,10 +1,12 @@
 import { getAddress, isAddress, zeroAddress, type Address, type Hex } from "viem";
 
+import { MAINNET_PAY_BASE_URL } from "./addresses.js";
 import { NotaError } from "./errors.js";
 import type { CheckoutMetadata, PaymentRequest, SignedReceiptQuote } from "./types.js";
 
 export const LINK_VERSION = 1;
-export const DEFAULT_BASE_URL = "https://usenota.xyz/pay";
+/** Mainnet payment page. `createRequest` uses the chain's own `payBaseUrl` instead. */
+export const DEFAULT_BASE_URL = MAINNET_PAY_BASE_URL;
 /** Fragment parameter carrying the payload. The fragment never reaches a server. */
 export const LINK_PARAM = "r";
 

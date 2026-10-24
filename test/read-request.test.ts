@@ -81,6 +81,7 @@ beforeEach(async () => {
 describe("createRequest", () => {
   it("produces a payable, decodable link with an unbound quote", async () => {
     expect(created.url.startsWith("https://usenota.xyz/pay#r=")).toBe(true);
+    expect((await newRequest({ baseUrl: "http://localhost:3000/pay" })).url.startsWith("http://localhost:3000/pay#r=")).toBe(true);
     expect(created.quote.buyer).toBe("0x0000000000000000000000000000000000000000");
     expect(created.quote.integratorFeeAmount).toBe(0n);
     expect(created.quote.metadataHash).toBe(hashCheckoutMetadata(created.metadata));
@@ -144,6 +145,7 @@ describe("createRequest", () => {
     const id = sepolia.addListing(seller.address);
     const r = await createRequest({ account: seller, publicClient: sepolia.client, listingId: id, amount: 100n, purpose: "testnet" });
     expect(r.chainId).toBe(421614);
+    expect(r.url.startsWith("https://dev.usenota.xyz/pay#r=")).toBe(true);
     expect(r.store).toBe("0x6b13e2077c84e1326111acBbb618E028723e2EA2");
     expect(r.metadata.protocol.settlementToken).toBe("0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d");
     expect((await readRequest(r.url, { publicClient: sepolia.client })).status).toBe("payable");
