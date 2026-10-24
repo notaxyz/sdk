@@ -13,7 +13,14 @@ export interface NotaDeployment {
   explorer: string;
   /** True for test networks, whose USDC has no value. */
   testnet: boolean;
+  /** Payment page that links for this chain point at by default, without a fragment. */
+  payBaseUrl: string;
 }
+
+/** Payment page for mainnet links. */
+export const MAINNET_PAY_BASE_URL = "https://usenota.xyz/pay";
+/** Payment page for testnet links. */
+export const TESTNET_PAY_BASE_URL = "https://dev.usenota.xyz/pay";
 
 /** NotaReceiptStore on the mainnets (Arbitrum One and Base). */
 export const NOTA_RECEIPT_STORE: Address = "0xf6062F3F52D3E19cb9cc3e027491a5c11D101F88";
@@ -35,6 +42,7 @@ export const NOTA_DEPLOYMENTS = {
     usdc: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
     explorer: "https://arbiscan.io",
     testnet: false,
+    payBaseUrl: MAINNET_PAY_BASE_URL,
   },
   8453: {
     chainId: 8453,
@@ -44,6 +52,7 @@ export const NOTA_DEPLOYMENTS = {
     usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     explorer: "https://basescan.org",
     testnet: false,
+    payBaseUrl: MAINNET_PAY_BASE_URL,
   },
   421614: {
     chainId: 421614,
@@ -53,6 +62,7 @@ export const NOTA_DEPLOYMENTS = {
     usdc: "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
     explorer: "https://sepolia.arbiscan.io",
     testnet: true,
+    payBaseUrl: TESTNET_PAY_BASE_URL,
   },
 } as const satisfies Record<number, NotaDeployment>;
 
