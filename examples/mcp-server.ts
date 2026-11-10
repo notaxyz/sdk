@@ -7,7 +7,8 @@
  *                       Never printed or logged.
  *   LISTING_ID          the seller's listing (see `setup` / examples/agent.ts --setup)
  *   RPC_URL             the chain is taken from this endpoint's chain id
- *   PAY_BASE_URL        optional; payment page the links point at (default https://usenota.xyz/pay)
+ *   PAY_BASE_URL        optional; payment page the links point at (default: the chain's page,
+ *                       https://usenota.xyz/pay on mainnets, https://dev.usenota.xyz/pay on testnets)
  *   DEMO_PRICE_USDC     optional; minimum paid for the demo action (default 0.10)
  *
  * Tools:
@@ -25,8 +26,7 @@
  *         "env": {
  *           "SIGNER_PRIVATE_KEY": "0x...",
  *           "LISTING_ID": "1",
- *           "RPC_URL": "https://...",
- *           "PAY_BASE_URL": "https://usenota.xyz/pay"
+ *           "RPC_URL": "https://..."
  *         }
  *       }
  *     }
@@ -42,7 +42,6 @@ import { privateKeyToAccount } from "viem/accounts";
 import { z } from "zod";
 
 import {
-  DEFAULT_BASE_URL,
   NotaError,
   assertDeployment,
   createRequest,
@@ -88,7 +87,7 @@ function newRequestId(): string {
 
 export function createPaymentServer(config: PaymentServerConfig): McpServer {
   const { publicClient, account, listingId, deployment } = config;
-  const baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
+  const baseUrl = config.baseUrl ?? deployment.payBaseUrl;
   const demoPrice = config.demoPrice ?? 100_000n;
   const requests = new Map<string, StoredRequest>();
   const usedReceipts = new Set<string>();
@@ -248,8 +247,8 @@ async function main(): Promise<void> {
   if (!privateKey || !/^0x[0-9a-fA-F]{64}$/.test(privateKey)) fail("SIGNER_PRIVATE_KEY must be set to a 0x-prefixed 32-byte hex key.");
   if (!rpcUrl) fail("RPC_URL must be set.");
   if (!listingIdRaw || !/^[1-9][0-9]*$/.test(listingIdRaw)) fail("LISTING_ID must be set to a listing id.");
-  const baseUrl = process.env.PAY_BASE_URL || DEFAULT_BASE_URL;
-  if (!/^https?:\/\/[^#]+$/.test(baseUrl)) fail("PAY_BASE_URL must be an http(s) URL without a fragment.");
+  const baseUrl = process.env.PAY_BASE_URL || undefined;
+  if (baseUrl !== undefined && !/^https?:\/\/[^#]+$/.test(baseUrl)) fail("PAY_BASE_URL must be an http(s) URL without a fragment.");
 
   const publicClient = createPublicClient({ transport: http(rpcUrl) }) as PublicClient;
   const chainId = await publicClient.getChainId();
@@ -264,7 +263,7 @@ async function main(): Promise<void> {
   if (!canSign) fail(`${account.address} is not the seller of listing ${listingId} or an authorized signer for it.`);
 
   const demoPrice = process.env.DEMO_PRICE_USDC ? parseUsdc(process.env.DEMO_PRICE_USDC) : undefined;
-  const server = createPaymentServer({ publicClient, account, listingId, deployment, baseUrl, ...(demoPrice !== undefined ? { demoPrice } : {}) });
+  const server = createPaymentServer({ publicClient, account, listingId, deployment, ...(baseUrl !== undefined ? { baseUrl } : {}), ...(demoPrice !== undefined ? { demoPrice } : {}) });
   await server.connect(new StdioServerTransport());
   // stdout carries the MCP protocol; diagnostics go to stderr. The key is never printed.
   console.error(`nota-payments MCP server: ${deployment.name} (${chainId})${deployment.testnet ? " [testnet]" : ""}, signer ${account.address}, listing ${listingId}`);

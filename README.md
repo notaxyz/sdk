@@ -117,7 +117,7 @@ It provides three tools:
 | `check_payment(request_id)` | returns `paid` (with the receipt and an explorer link), `pending`, `expired` or `blocked` |
 | `premium_fortune(request_id, topic)` | demo paid action: refuses until `check_payment` would say `paid` for a request whose purpose is `premium fortune`, at the demo price or more, and runs once per receipt |
 
-It reads `SIGNER_PRIVATE_KEY` (the seller or an authorized signer; never printed), `LISTING_ID`, `RPC_URL` (the chain is taken from it) and `PAY_BASE_URL`. To add it to a desktop client, for example in `claude_desktop_config.json`, use absolute paths:
+It reads `SIGNER_PRIVATE_KEY` (the seller or an authorized signer; never printed), `LISTING_ID`, `RPC_URL` (the chain is taken from it) and, optionally, `PAY_BASE_URL` (default: the chain's payment page). To add it to a desktop client, for example in `claude_desktop_config.json`, use absolute paths:
 
 ```json
 {
@@ -128,8 +128,7 @@ It reads `SIGNER_PRIVATE_KEY` (the seller or an authorized signer; never printed
       "env": {
         "SIGNER_PRIVATE_KEY": "0x...",
         "LISTING_ID": "1",
-        "RPC_URL": "https://...",
-        "PAY_BASE_URL": "https://usenota.xyz/pay"
+        "RPC_URL": "https://..."
       }
     }
   }
@@ -145,6 +144,8 @@ Run `npm ci` in the repo first. A server-side signer key fits this setup well; s
 ```
 https://usenota.xyz/pay#r=<base64url(JSON)>
 ```
+
+Links point at `https://usenota.xyz/pay` on the mainnets and at `https://dev.usenota.xyz/pay` on Arbitrum Sepolia: each deployment's `payBaseUrl`. Pass `baseUrl` to `createRequest` to use a different page.
 
 The payload sits in the URL fragment, which browsers never send to a server. The JSON is:
 
@@ -203,6 +204,7 @@ Malformed input and unknown link versions throw `NotaError` with code `"invalid_
 | PurchaseRefRegistry | `0x9AaFfA5787ca332a40B9C98E3e5323A97F96D991` | `0x9AaFfA5787ca332a40B9C98E3e5323A97F96D991` | `0x32aAeC7768adBBFD65C776b129616b8727d0c8bd` |
 | USDC | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d` (test USDC, no value) |
 | Explorer | arbiscan.io | basescan.org | sepolia.arbiscan.io |
+| Payment page | usenota.xyz/pay | usenota.xyz/pay | dev.usenota.xyz/pay |
 
 Arbitrum Sepolia is a testnet for trying the flow end to end with test USDC. Its deployment entry is marked `testnet: true`.
 

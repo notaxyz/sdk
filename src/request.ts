@@ -13,7 +13,7 @@ import { notaReceiptStoreAbi } from "./abi.js";
 import { getDeployment, type NotaDeployment } from "./addresses.js";
 import { assertDeployment } from "./deployment.js";
 import { NotaError } from "./errors.js";
-import { DEFAULT_BASE_URL, decodeRequest, encodeRequest } from "./link.js";
+import { decodeRequest, encodeRequest } from "./link.js";
 import {
   buildCheckoutMetadata,
   findMetadataProblems,
@@ -44,7 +44,7 @@ export type CreateRequestParams = {
   expiresInSeconds?: number;
   /** 32-byte hex agent identifier, seller-attested. Default zero (unspecified). */
   agentId?: Hex;
-  /** Default `https://usenota.xyz/pay`. */
+  /** Default: the chain's `payBaseUrl` (`https://usenota.xyz/pay` on mainnets, `https://dev.usenota.xyz/pay` on testnets). */
   baseUrl?: string;
   /** Business reference hashed into purchaseRef; 1 to 128 bytes. Default: a random `nota_request_...`. */
   rawPurchaseRef?: string;
@@ -181,7 +181,7 @@ export async function createRequest(params: CreateRequestParams): Promise<Create
     metadata,
     fromBlock: block.number,
   };
-  return { ...request, fromBlock: block.number, url: encodeRequest(request, params.baseUrl ?? DEFAULT_BASE_URL), purchaseRef };
+  return { ...request, fromBlock: block.number, url: encodeRequest(request, params.baseUrl ?? deployment.payBaseUrl), purchaseRef };
 }
 
 function validateOnChain(
